@@ -23,6 +23,22 @@ def test_unicode_normalization():
     assert len(find_duplicates([Track("1", "Café", "Artist"), Track("2", "Cafe\u0301", "artist")])) == 1
 
 
+@pytest.mark.parametrize("artist", ["Alice & Bob", "Alice+Bob", "  ALICE   BOB ", "Alice  +  & Bob"])
+def test_ignores_artist_separators_and_extra_spaces(artist):
+    assert Track("1", "Song", artist).duplicate_key == Track("2", "song", "Alice Bob").duplicate_key
+
+
+@pytest.mark.parametrize("title", ["Song (Original)", "Song (ORIGINAL)  ", "(Original) Song"])
+def test_ignores_original_title_designation(title):
+    assert Track("1", title, "Artist").duplicate_key == Track("2", "Song", "Artist").duplicate_key
+    assert Track("1", "Song (Original Mix)", "Artist").duplicate_key != Track("2", "Song", "Artist").duplicate_key
+
+
+def test_ignored_metadata_alone_does_not_form_a_group():
+    assert not find_duplicates([Track("1", "(Original)", "Artist"), Track("2", "(Original)", "Artist")])
+    assert not find_duplicates([Track("1", "Song", "+ &"), Track("2", "Song", " & + ")])
+
+
 def test_recommendation_prefers_bitrate_then_playlist_membership():
     tracks = [Track("missing", "A", "B", bitrate=1411, cues=99),
               Track("available", "A", "B", available=True, bitrate=320),

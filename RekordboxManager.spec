@@ -4,7 +4,7 @@ from rekordbox_manager import __version__
 
 license_metadata = []
 for package in ("pyrekordbox", "PySide6-Essentials", "PySide6-Addons", "shiboken6", "sqlcipher3-wheels", "Send2Trash",
-                "pywin32", "SQLAlchemy", "numpy", "psutil", "construct", "bidict", "python-dateutil"):
+                "pywin32", "SQLAlchemy", "numpy", "av", "psutil", "construct", "bidict", "python-dateutil"):
     license_metadata += copy_metadata(package)
 
 analysis = Analysis(

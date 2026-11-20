@@ -21,6 +21,7 @@ import psutil
 from sqlcipher3 import dbapi2 as sql
 
 from .domain import Library, ManagerError, RemovalPlan, Track, find_duplicates, validate_plan
+from .comparison import verify_duplicate_groups
 from .recycle import recycle_file
 
 
@@ -198,7 +199,8 @@ def load_library(path: str | Path) -> Library:
         after = fingerprint(path)
         if before != after:
             raise ManagerError("Die Datenbank wurde während des Lesens geändert. Bitte Rekordbox schließen und neu laden.")
-        return Library(path, tracks, after, encrypted, db_id, find_duplicates(tracks))
+        groups, notices = verify_duplicate_groups(find_duplicates(tracks))
+        return Library(path, tracks, after, encrypted, db_id, groups, notices)
     except ManagerError:
         raise
     except (sql.Error, OSError, ValueError) as exc:
@@ -381,7 +383,8 @@ def _library_after_rename(library: Library, affected_ids: set[str], track_id: st
                  path=str(destination), available=True) if track.id in affected_ids else track
          for track in library.tracks),
         key=lambda track: (track.title.casefold(), track.artist.casefold(), track.id)))
-    return replace(library, tracks=tracks, fingerprint=state, groups=find_duplicates(tracks))
+    groups, notices = verify_duplicate_groups(find_duplicates(tracks))
+    return replace(library, tracks=tracks, fingerprint=state, groups=groups, duplicate_notices=notices)
 
 
 def _renamed_audio_path(source: Path, artist: str, title: str) -> Path:

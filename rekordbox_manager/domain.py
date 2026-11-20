@@ -17,6 +17,14 @@ def normalize(value: str) -> str:
     return " ".join(unicodedata.normalize("NFC", value).casefold().split())
 
 
+def duplicate_artist(value: str) -> str:
+    return normalize(value.replace("+", " ").replace("&", " "))
+
+
+def duplicate_title(value: str) -> str:
+    return normalize(normalize(value).replace("(original)", " "))
+
+
 def date_key(value: str) -> str:
     try:
         return datetime.fromisoformat(value.strip()[:10]).date().isoformat()
@@ -54,7 +62,7 @@ class Track:
 
     @property
     def duplicate_key(self) -> tuple[str, str] | None:
-        title, artist = normalize(self.title), normalize(self.artist)
+        title, artist = duplicate_title(self.title), duplicate_artist(self.artist)
         return (title, artist) if title and artist else None
 
     @property
@@ -67,6 +75,7 @@ class DuplicateGroup:
     key: tuple[str, str]
     tracks: tuple[Track, ...]
     recommended_id: str
+    similarity: float | None = None
 
 
 def recommendation_rank(track: Track) -> tuple:
@@ -95,6 +104,7 @@ class Library:
     encrypted: bool
     db_id: str
     groups: tuple[DuplicateGroup, ...]
+    duplicate_notices: tuple[str, ...] = ()
 
     @cached_property
     def by_id(self) -> dict[str, Track]:
@@ -111,11 +121,11 @@ def validate_plan(library: Library, plan: RemovalPlan) -> None:
     if not plan.replacements:
         raise ManagerError("Bitte zuerst Duplikate zum Entfernen markieren.")
     tracks = library.by_id
-    duplicate_ids = {t.id for g in library.groups for t in g.tracks}
+    group_ids = {t.id: g.recommended_id for g in library.groups for t in g.tracks}
     for removed, retained in plan.replacements.items():
         if removed not in tracks or retained not in tracks:
             raise ManagerError("Die Auswahl enthält einen nicht mehr vorhandenen Titel. Bitte neu laden.")
         if removed == retained or retained in plan.replacements:
             raise ManagerError("In jeder Duplikatgruppe muss mindestens ein Titel behalten werden.")
-        if removed not in duplicate_ids or tracks[removed].duplicate_key != tracks[retained].duplicate_key:
+        if removed not in group_ids or group_ids[removed] != group_ids.get(retained):
             raise ManagerError("Ein Titel darf nur durch ein Duplikat derselben Gruppe ersetzt werden.")

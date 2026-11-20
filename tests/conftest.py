@@ -1,17 +1,20 @@
 import base64
+from io import BytesIO
 import os
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+import av
+import numpy as np
 from sqlcipher3 import dbapi2 as sql
 
 from rekordbox_manager import database
 
 
 @pytest.fixture
-def collection(tmp_path, monkeypatch):
+def collection(tmp_path, monkeypatch, synthetic_mp3_audio):
     """A small encrypted collection with committed changes living in its WAL."""
     monkeypatch.setattr(database, "require_rekordbox_closed", lambda: None)
 
@@ -64,7 +67,7 @@ def collection(tmp_path, monkeypatch):
                                   ("copy", "  searching   MEMORY ", "2026-01-01"),
                                   ("remix", "Searching Memory (Remix)", "2026-01-02")):
         music = tmp_path / f"{track_id}.mp3"
-        music.write_bytes(b"synthetic test audio; not a real track")
+        music.write_bytes(synthetic_mp3_audio)
         conn.execute("INSERT INTO djmdContent VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                      (track_id, title, "artist", str(music), date, "/PIONEER/Artwork/cover.png",
                       380, 320, f"uuid-{track_id}", 0, 10, "", date))
@@ -74,6 +77,24 @@ def collection(tmp_path, monkeypatch):
         '</PLAYLISTS></MASTER_PLAYLIST>', encoding="utf-8")
     yield path, conn
     conn.close()
+
+
+@pytest.fixture(scope="session")
+def synthetic_mp3_audio():
+    """A real encoded, deterministic signal shared by the isolated test collection."""
+    buffer = BytesIO()
+    with av.open(buffer, "w", format="mp3") as output:
+        stream = output.add_stream("libmp3lame", rate=8000)
+        stream.layout = "mono"
+        stream.bit_rate = 64000
+        samples = np.random.default_rng(17).normal(0, 3000, 12 * 8000).astype("<i2")
+        frame = av.AudioFrame.from_ndarray(samples.reshape(1, -1), format="s16", layout="mono")
+        frame.sample_rate = 8000
+        for packet in stream.encode(frame):
+            output.mux(packet)
+        for packet in stream.encode(None):
+            output.mux(packet)
+    return buffer.getvalue()
 
 
 @pytest.fixture(scope="session")

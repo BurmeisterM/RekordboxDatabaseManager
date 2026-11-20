@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import sys
 import traceback
+from threading import Event
 
 from PySide6.QtCore import (
     QAbstractTableModel, QEvent, QModelIndex, QObject, QRunnable, QSettings,
@@ -14,7 +15,7 @@ from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon,
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog,
     QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLayout,
-    QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar, QPushButton,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
     QScrollArea, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget,
 )
 
@@ -24,6 +25,8 @@ from .database import (
 )
 from .domain import Library, ManagerError, RemovalPlan, Track, display_date, normalize, validate_plan
 from .playback import AudioPreview
+from .comparison import compare_tracks
+from .comparison_ui import ComparisonPage
 
 
 STYLE = """
@@ -269,7 +272,8 @@ class TrackModel(QAbstractTableModel):
         self.library: Library | None = None
         self.rows: list[Track] = []
         self.selected: set[str] = set()
-        self.keepers: dict[tuple[str, str], str] = {}
+        self.keepers: dict[str, str] = {}
+        self.groups_by_track = {}
         self.group_numbers: dict[str, int] = {}
         self.recommended: set[str] = set()
         self.covers = CoverCache()
@@ -281,7 +285,8 @@ class TrackModel(QAbstractTableModel):
     def set_library(self, library: Library):
         self.library = library
         self.selected.clear()
-        self.keepers = {g.key: g.recommended_id for g in library.groups}
+        self.keepers = {g.recommended_id: g.recommended_id for g in library.groups}
+        self.groups_by_track = {t.id: g for g in library.groups for t in g.tracks}
         self.recommended = {g.recommended_id for g in library.groups}
         self.group_numbers = {t.id: index for index, g in enumerate(library.groups, 1) for t in g.tracks}
         self.covers = CoverCache()
@@ -293,10 +298,10 @@ class TrackModel(QAbstractTableModel):
         if self.duplicates_only:
             tracks = tuple(t for g in self.library.groups for t in g.tracks) if self.library else ()
         needle = normalize(self.search)
-        matched_keys = {t.duplicate_key for t in tracks
+        matched_keys = {self.group_numbers.get(t.id) for t in tracks
                         if needle in normalize(f"{t.title} {t.artist} {t.path}")}
         self.rows = [t for t in tracks if not needle or
-                     (self.duplicates_only and t.duplicate_key in matched_keys) or
+                     (self.duplicates_only and self.group_numbers.get(t.id) in matched_keys) or
                      (not self.duplicates_only and needle in normalize(f"{t.title} {t.artist} {t.path}"))]
         self._sort_rows()
         self.endResetModel()
@@ -314,7 +319,8 @@ class TrackModel(QAbstractTableModel):
         return None
 
     def is_keeper(self, track: Track) -> bool:
-        return self.keepers.get(track.duplicate_key) == track.id
+        group = self.groups_by_track.get(track.id)
+        return group is not None and self.keepers.get(group.recommended_id) == track.id
 
     def data(self, index, role=Qt.ItemDataRole.DisplayRole):
         if not index.isValid():
@@ -339,6 +345,10 @@ class TrackModel(QAbstractTableModel):
                 return "Playlists:\n" + "\n".join(track.playlist_names) if track.playlists else "Keine Playlist"
             if col == 11:
                 return track.path
+            if col in (9, 10) and group:
+                score = self.groups_by_track[track.id].similarity
+                if score is not None:
+                    return f"Audio geprüft: mindestens {score:.4f} % Signalähnlichkeit zwischen allen Gruppenmitgliedern · fünf Sekunden um die Dateimitte"
             return f"{track.title} · {track.artist}\n{track.path}\nID: {track.id}"
         if role == Qt.ItemDataRole.ForegroundRole:
             if track.id in self.selected:
@@ -362,6 +372,8 @@ class TrackModel(QAbstractTableModel):
                 state = "Behalten · Tipp" if track.id in self.recommended else "Behalten"
             elif group:
                 state = "Duplikat"
+            if group and track.id not in self.selected and self.groups_by_track[track.id].similarity is not None:
+                state += f" · {self.groups_by_track[track.id].similarity:.2f} %"
             values = ["", "", track.title or "Ohne Titel", track.artist or "Unbekannt",
                       display_date(track.added), track.duration_text,
                       str(track.bitrate) if track.bitrate else "–", track.playlist_text,
@@ -391,12 +403,12 @@ class TrackModel(QAbstractTableModel):
         warning = ""
         if checked:
             self.selected.add(track.id)
-            group = next(g for g in self.library.groups if g.key == track.duplicate_key)
+            group = self.groups_by_track[track.id]
             all_selected = all(t.id in self.selected for t in group.tracks)
             if self.is_keeper(track):
                 alternatives = [t for t in group.tracks if t.id != track.id]
                 retained = next((t for t in alternatives if t.id not in self.selected), alternatives[0])
-                self.keepers[group.key] = retained.id
+                self.keepers[group.recommended_id] = retained.id
                 self.selected.discard(retained.id)
                 if all_selected:
                     warning = (f'Alle Titel der Duplikatgruppe „{track.title}“ von {track.artist} wurden zum Entfernen markiert.\n\n'
@@ -406,7 +418,7 @@ class TrackModel(QAbstractTableModel):
         else:
             self.selected.discard(track.id)
         for row, item in enumerate(self.rows):
-            if item.duplicate_key == track.duplicate_key:
+            if self.group_numbers.get(item.id) == self.group_numbers.get(track.id):
                 self.dataChanged.emit(self.index(row, 0), self.index(row, self.columnCount() - 1))
         self.selection_changed.emit()
         if warning:
@@ -416,16 +428,16 @@ class TrackModel(QAbstractTableModel):
     def keep(self, track: Track):
         if track.id not in self.group_numbers:
             return
-        self.keepers[track.duplicate_key] = track.id
+        self.keepers[self.groups_by_track[track.id].recommended_id] = track.id
         self.selected.discard(track.id)
         self.refresh()
 
     def apply_recommendations(self):
         # Only groups currently visible in the filter are affected.
-        visible = {t.duplicate_key for t in self.rows if t.id in self.group_numbers}
+        visible = {self.groups_by_track[t.id].recommended_id for t in self.rows if t.id in self.group_numbers}
         for group in self.library.groups if self.library else ():
-            if group.key in visible:
-                self.keepers[group.key] = group.recommended_id
+            if group.recommended_id in visible:
+                self.keepers[group.recommended_id] = group.recommended_id
                 self.selected.discard(group.recommended_id)
                 self.selected.update(t.id for t in group.tracks if t.id != group.recommended_id)
         self.refresh()
@@ -435,8 +447,7 @@ class TrackModel(QAbstractTableModel):
         self.refresh()
 
     def plan(self) -> RemovalPlan:
-        by_id = self.library.by_id
-        plan = RemovalPlan({i: self.keepers[by_id[i].duplicate_key] for i in sorted(self.selected)})
+        plan = RemovalPlan({i: self.keepers[self.groups_by_track[i].recommended_id] for i in sorted(self.selected)})
         validate_plan(self.library, plan)
         return plan
 
@@ -459,17 +470,19 @@ class TrackModel(QAbstractTableModel):
 class TaskSignals(QObject):
     done = Signal(object)
     failed = Signal(str)
+    progress = Signal(int, int, str)
 
 
 class Task(QRunnable):
-    def __init__(self, function):
+    def __init__(self, function, with_progress=False):
         super().__init__()
         self.function = function
+        self.with_progress = with_progress
         self.signals = TaskSignals()
 
     def run(self):
         try:
-            result = self.function()
+            result = self.function(self.signals.progress.emit) if self.with_progress else self.function()
         except ManagerError as exc:
             self.signals.failed.emit(str(exc))
         except Exception as exc:
@@ -587,6 +600,8 @@ class MainWindow(QMainWindow):
         self.library: Library | None = None
         self.busy = False
         self.active_task = None
+        self.comparison_view = False
+        self.comparison_cancel = None
         self.last_backup: Path | None = None
         self.settings = app_settings()
         self.model = TrackModel()
@@ -625,8 +640,9 @@ class MainWindow(QMainWindow):
         side.addWidget(label("VERWALTUNG", "muted"))
         self.all_button = button("♫   Alle Titel", lambda: self.set_view(False), "nav")
         self.dupes_button = button("≋   Doppelte Titel", lambda: self.set_view(True), "nav")
+        self.compare_button = button("♫   Trackvergleich", self.set_comparison_view, "nav")
         nav = QButtonGroup(self)
-        for widget in (self.all_button, self.dupes_button):
+        for widget in (self.all_button, self.dupes_button, self.compare_button):
             widget.setCheckable(True)
             nav.addButton(widget)
             side.addWidget(widget)
@@ -653,7 +669,7 @@ class MainWindow(QMainWindow):
         top.addWidget(self.reload_button)
         top.addWidget(self.open_button)
         content.addLayout(top)
-        self.description = label("Gleicher Titel + Interpret. Mix-Bezeichnungen bleiben berücksichtigt.", "muted")
+        self.description = label("Gleicher Titel und Interpret · Audioübereinstimmung über 90 % in fünf Sekunden um die Dateimitte.", "muted")
         content.addWidget(self.description)
         self.path_label = label("Keine Sammlung geöffnet · Wähle eine master.db auf deinem PC oder einem externen Laufwerk.", "muted", True)
         self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -721,6 +737,12 @@ class MainWindow(QMainWindow):
         self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         table_layout.addWidget(self.table, 1)
         table_layout.addWidget(self.empty_label)
+        self.duplicate_notices = QPlainTextEdit()
+        self.duplicate_notices.setReadOnly(True)
+        self.duplicate_notices.setMaximumHeight(100)
+        self.duplicate_notices.setAccessibleName("Nicht prüfbare Duplikatkandidaten")
+        self.duplicate_notices.hide()
+        table_layout.addWidget(self.duplicate_notices)
         self.splitter.addWidget(table_area)
         self.detail = QFrame()
         self.detail.setMinimumWidth(220)
@@ -764,6 +786,12 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.detail_scroll)
         self.splitter.setSizes([980, 250])
         content.addWidget(self.splitter, 1)
+        self.comparison_page = ComparisonPage()
+        self.comparison_page.start_requested.connect(self.start_comparison)
+        self.comparison_page.cancel_requested.connect(self.cancel_comparison)
+        self.comparison_page.preview_requested.connect(self.preview.toggle)
+        self.comparison_page.hide()
+        content.addWidget(self.comparison_page, 1)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
@@ -805,17 +833,74 @@ class MainWindow(QMainWindow):
         return value
 
     def set_view(self, duplicates_only):
+        self.comparison_view = False
+        self.comparison_page.hide()
+        self.splitter.show()
+        self.all_button.setChecked(not duplicates_only)
+        self.dupes_button.setChecked(duplicates_only)
+        self.set_comparison_controls(False)
         self.model.duplicates_only = duplicates_only
         self.heading.setText("Doppelte Titel" if duplicates_only else "Alle Titel")
-        self.description.setText("Gleicher Titel + Interpret. Mix-Bezeichnungen bleiben berücksichtigt."
+        self.description.setText("Gleicher Titel und Interpret · Audioübereinstimmung über 90 % in fünf Sekunden um die Dateimitte."
                                  if duplicates_only else "Deine Sammlung mit Cover, Titel, Interpret und Hinzufügedatum.")
+        self.duplicate_notices.setVisible(bool(duplicates_only and self.library and self.library.duplicate_notices))
         self.model.refresh()
         self.reset_details()
+
+    def set_comparison_controls(self, comparison):
+        for widget in (self.recommend_button, self.clear_button, self.backup_button, self.remove_button,
+                       self.dupe_stat.parentWidget(), self.selected_stat.parentWidget()):
+            widget.setVisible(not comparison)
+
+    def set_comparison_view(self):
+        self.comparison_view = True
+        self.compare_button.setChecked(True)
+        self.splitter.hide()
+        self.comparison_page.show()
+        self.set_comparison_controls(True)
+        self.heading.setText("Trackvergleich")
+        self.description.setText("MP3-Audiovergleich innerhalb desselben Interpreten: fünf Sekunden um die Dateimitte · mindestens 90 % Signalähnlichkeit. "
+                                 "Treffer gelten für diesen Ausschnitt.")
+        self.description.setWordWrap(True)
+        self.comparison_page.model.search = self.search.text()
+        self.comparison_page.model.refresh()
+        self.update_summary()
+
+    def start_comparison(self):
+        if self.busy or not self.library:
+            return
+        tracks = self.library.tracks
+        self.comparison_cancel = Event()
+        cancel = self.comparison_cancel
+        self.comparison_page.start()
+
+        def completed(result):
+            self.comparison_cancel = None
+            self.comparison_page.finish(result)
+            self.status_label.setText(self.comparison_page.status.text())
+            self.update_summary()
+
+        def failed(message):
+            self.comparison_cancel = None
+            self.comparison_page.stop()
+            self.comparison_page.status.setText("Trackvergleich fehlgeschlagen: " + message)
+            self.task_failed(message)
+
+        self.run_task(lambda report: compare_tracks(tracks, cancel, report), completed,
+                      "Trackvergleich läuft · Audioausschnitte werden nur gelesen …", failure=failed,
+                      progress=self.comparison_page.report_progress)
+
+    def cancel_comparison(self):
+        if self.comparison_cancel is not None:
+            self.comparison_cancel.set()
 
     def filter_rows(self, text):
         self.model.search = text
         self.model.refresh()
         self.reset_details()
+        self.comparison_page.model.search = text
+        self.comparison_page.model.refresh()
+        self.update_summary()
 
     def choose_database(self):
         def discovered(path):
@@ -885,7 +970,10 @@ class MainWindow(QMainWindow):
         self.startup_timer.stop()
         self.preview.stop()
         self.library = library
+        self.comparison_page.reset()
         self.model.set_library(library)
+        self.duplicate_notices.setPlainText("Nicht prüfbare Duplikatkandidaten:\n\n" + "\n\n".join(library.duplicate_notices))
+        self.duplicate_notices.setVisible(bool(self.model.duplicates_only and library.duplicate_notices))
         self.path_label.setText(str(library.path))
         self.path_label.setToolTip(str(library.path))
         self.settings.setValue("last_database", str(library.path))
@@ -893,11 +981,12 @@ class MainWindow(QMainWindow):
         self.reset_details()
         excluded = sum(1 for t in library.tracks if t.duplicate_key is None)
         self.status_label.setText(
-            f"Sammlung geladen · {len(library.tracks)} Titel · {len(library.groups)} Duplikatgruppen."
+            f"Sammlung geladen · {len(library.tracks)} Titel · {len(library.groups)} audiogeprüfte Duplikatgruppen (> 90 %)."
+            + (f" {len(library.duplicate_notices)} Kandidaten nicht prüfbar." if library.duplicate_notices else "")
             + (f" {excluded} Titel ohne Titel/Interpret werden bei der Duplikatsuche ausgelassen." if excluded else ""))
         self.update_summary()
 
-    def run_task(self, function, callback, status, *, failure=None):
+    def run_task(self, function, callback, status, *, failure=None, progress=None):
         if self.busy:
             return
         self.startup_timer.stop()
@@ -906,7 +995,9 @@ class MainWindow(QMainWindow):
         self.set_controls()
         self.progress.show()
         self.status_label.setText(status)
-        task = Task(function)
+        task = Task(function, with_progress=progress is not None)
+        if progress is not None:
+            task.signals.progress.connect(progress)
         self.active_task = task
 
         def done(result):
@@ -929,8 +1020,9 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Vorgang nicht abgeschlossen", message)
 
     def set_controls(self):
-        for widget in (self.open_button, self.search, self.table, self.all_button, self.dupes_button):
+        for widget in (self.open_button, self.search, self.table, self.all_button, self.dupes_button, self.compare_button):
             widget.setEnabled(not self.busy)
+        self.comparison_page.set_available(bool(self.library), self.busy)
         self.reload_button.setEnabled(bool(self.library) and not self.busy)
         self.recommend_button.setEnabled(bool(self.library and self.library.groups) and not self.busy)
         self.clear_button.setEnabled(bool(self.model.selected) and not self.busy)
@@ -955,6 +1047,8 @@ class MainWindow(QMainWindow):
                 self.empty_label.setText("Keine Treffer für diesen Filter." if self.search.text() else
                                          "Keine doppelten Titel gefunden." if self.model.duplicates_only else "Diese Sammlung enthält keine Titel.")
         self.empty_label.setVisible(not self.model.rows)
+        if self.comparison_view:
+            self.summary.setText(f"{len(self.comparison_page.model.rows)} Trefferpaare angezeigt · Mindestähnlichkeit 90 %")
         self.set_controls()
 
     def current_track(self):
@@ -1001,6 +1095,11 @@ class MainWindow(QMainWindow):
             "Bei weiterem Gleichstand: Datei erreichbar → Cues → ältestes Hinzufügedatum → Titel-ID. "
             "Die Empfehlung lässt sich manuell ändern."
             if track.id in self.model.recommended else "")
+        group = self.model.groups_by_track.get(track.id)
+        if group and group.similarity is not None:
+            self.detail_reason.setText(self.detail_reason.text() +
+                                      f"\n\nAudio geprüft: mindestens {group.similarity:.4f} % Übereinstimmung "
+                                      "im mittleren Fünf-Sekunden-Ausschnitt zwischen allen Gruppenmitgliedern.")
         self.keep_button.setEnabled(track.id in self.model.group_numbers and not self.busy)
 
     def keep_current(self):
@@ -1134,8 +1233,14 @@ class MainWindow(QMainWindow):
             "Doppelklick auf einen Titelnamen: bearbeiten. Return speichert den Titel und benennt die Datei nach "
             "„Interpret - Titel“ mit ihrer bisherigen Dateiendung um. Escape oder Verlassen des Feldes bricht ab. "
             "Dateiverknüpfungen werden aktualisiert und Duplikatgruppen neu geprüft; die Lösch-Auswahl wird zurückgesetzt.\n\n"
-            "Die Suche ignoriert Groß-/Kleinschreibung und überzählige Leerzeichen. "
-            "Mix-Namen und Satzzeichen bleiben relevant. Gleiche Metadaten garantieren keinen identischen Audioinhalt.\n\n"
+            "Doppelte Titel: Die Vorauswahl ignoriert Groß-/Kleinschreibung und überzählige Leerzeichen, "
+            "beim Interpreten zusätzlich + und &, beim Titel (Original). Andere Mix-Namen und Satzzeichen bleiben relevant. "
+            "Anschließend werden fünf Sekunden aus der tatsächlichen Dateimitte verglichen. "
+            "Nur Gruppen mit mehr als 90 % Signalähnlichkeit werden als Duplikate angezeigt. "
+            "Nicht lesbare, zu kurze oder stille Kandidaten werden mit Grund ausgelassen.\n\n"
+            "Trackvergleich: Nur MP3-Dateien desselben Interpreten werden verglichen. Je Datei werden fünf Sekunden um die tatsächliche Mitte "
+            "verglichen. Trefferpaare ab 90 % Signalähnlichkeit erscheinen mit beiden Dateipfaden. "
+            "Track A/B anhören ermöglicht das Prüfen. Stille, zu kurze und unlesbare Dateien werden mit Grund übersprungen.\n\n"
             "Vorschläge übernehmen wirkt auf sichtbare Gruppen; eine gefilterte Duplikatgruppe bleibt vollständig sichtbar. "
             "Markierungen außerhalb des Filters werden in der Fußzeile gezählt und vor dem Entfernen ebenfalls angezeigt.\n\n"
             "Vor Änderungen Rekordbox und Rekordbox Agent schließen. Musikdateien werden beim Entfernen automatisch "

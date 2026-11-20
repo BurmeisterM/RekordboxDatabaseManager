@@ -1,6 +1,11 @@
 import time
+from dataclasses import replace
+from threading import Event
+import wave
 
+import av
 import pytest
+import numpy as np
 
 from PySide6.QtCore import QPoint, Qt, QThread
 from PySide6.QtGui import QColor, QPalette
@@ -8,8 +13,10 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QFileDialog, QLineEdit, QMessageBox, QStyleOptionViewItem
 
 from rekordbox_manager.database import load_library
-from rekordbox_manager.domain import ManagerError, RemovalPlan, validate_plan
+from rekordbox_manager.domain import DuplicateGroup, ManagerError, RemovalPlan, validate_plan
 from rekordbox_manager.ui import MainWindow, RemovalDialog, Task, TrackModel, app_settings
+from rekordbox_manager.comparison import AudioMatch, ComparisonResult, compare_tracks
+from rekordbox_manager.comparison_ui import ComparisonModel
 
 
 @pytest.fixture(autouse=True)
@@ -27,7 +34,150 @@ def wait_for_window(window):
     deadline = time.monotonic() + 15
     while (window.startup_timer.isActive() or window.busy) and time.monotonic() < deadline:
         QTest.qWait(10)
+        # Let Python workers reacquire the GIL between native codec calls.
+        time.sleep(0.001)
     assert not window.startup_timer.isActive() and not window.busy
+
+
+def test_track_comparison_menu_and_background_scan(qt_app, collection, tmp_path, monkeypatch):
+    library = load_library(collection[0])
+    rng = np.random.default_rng(93)
+    first = rng.normal(0, 0.1, 8000 * 12)
+    tracks = []
+    for index, track in enumerate(library.tracks):
+        path = tmp_path / f"comparison-{index}.wav"
+        samples = first if index < 2 else rng.normal(0, 0.1, len(first))
+        with wave.open(str(path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(8000)
+            output.writeframes((samples * 32767).astype("<i2").tobytes())
+        mp3_path = path.with_suffix(".mp3")
+        with av.open(str(path)) as source, av.open(str(mp3_path), "w") as output:
+            stream = output.add_stream("libmp3lame", rate=8000)
+            stream.layout = "mono"
+            stream.bit_rate = 64000
+            for frame in source.decode(audio=0):
+                for packet in stream.encode(frame):
+                    output.mux(packet)
+            for packet in stream.encode(None):
+                output.mux(packet)
+        tracks.append(replace(track, path=str(mp3_path), title=f"Unterschiedlicher Titel {index}"))
+    threads = []
+
+    def compare(*args):
+        threads.append(QThread.currentThread())
+        return compare_tracks(*args)
+
+    monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", compare)
+    window = MainWindow()
+    window.loaded(replace(library, tracks=tuple(tracks)))
+    window.model.apply_recommendations()
+    selected = set(window.model.selected)
+    window.compare_button.click()
+    assert window.heading.text() == "Trackvergleich" and window.compare_button.isChecked()
+    assert window.splitter.isHidden() and not window.comparison_page.isHidden()
+    assert window.remove_button.isHidden()
+    window.comparison_page.start_button.click()
+    assert window.busy and window.comparison_page.cancel_button.isEnabled()
+    assert not window.reload_button.isEnabled()
+    wait_for_window(window)
+    page = window.comparison_page
+    assert threads and threads[0] != qt_app.thread()
+    assert len(page.model.rows) == 1 and page.model.rows[0].similarity > 99.9
+    assert page.model.columnCount() == 7
+    assert "1 Trefferpaare" in page.status.text()
+    assert window.model.selected == selected
+    window.search.setText("not present")
+    assert page.model.rowCount() == 0 and "0 Trefferpaare" in window.summary.text()
+    window.search.clear()
+    assert page.model.rowCount() == 1
+    page.table.setCurrentIndex(page.model.index(0, 0))
+    heard = []
+    page.preview_requested.connect(heard.append)
+    # Inspect the selected pair without invoking a playback backend in this test.
+    page.preview_requested.disconnect(window.preview.toggle)
+    page.preview_first.click()
+    page.preview_second.click()
+    assert heard == [page.model.rows[0].first, page.model.rows[0].second]
+    window.all_button.click()
+    assert not window.comparison_view and not window.splitter.isHidden()
+    assert window.comparison_page.isHidden() and not window.remove_button.isHidden()
+    window.loaded(library)
+    assert not page.model.rows and page.result is None
+    window.close()
+
+
+def test_track_comparison_reports_unreadable_files(qt_app, collection):
+    for path in collection[0].parent.glob("*.mp3"):
+        path.write_bytes(b"invalid audio")
+    window = MainWindow()
+    window.loaded(load_library(collection[0]))
+    window.compare_button.click()
+    window.comparison_page.start_button.click()
+    wait_for_window(window)
+    page = window.comparison_page
+    assert len(page.result.skipped) == 3
+    assert "3 übersprungen" in page.status.text()
+    assert not page.notices.isHidden() and "original.mp3" in page.notices.toPlainText()
+    assert page.start_button.isEnabled() and not page.cancel_button.isEnabled()
+    window.close()
+
+
+def test_track_comparison_can_be_cancelled_and_restarted(qt_app, collection, monkeypatch):
+    started = Event()
+
+    def compare(tracks, cancel, progress):
+        started.set()
+        assert cancel.wait(5)
+        return ComparisonResult(cancelled=True)
+
+    monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", compare)
+    window = MainWindow()
+    window.loaded(load_library(collection[0]))
+    window.compare_button.click()
+    window.comparison_page.start_button.click()
+    assert started.wait(5)
+    window.comparison_page.cancel_button.click()
+    wait_for_window(window)
+    assert "abgebrochen" in window.comparison_page.status.text()
+    assert window.comparison_page.start_button.isEnabled() and window.reload_button.isEnabled()
+    assert window.comparison_cancel is None and not window.comparison_page.model.rows
+    window.close()
+
+
+def test_track_comparison_failure_restores_controls(qt_app, collection, monkeypatch):
+    def fail(*args):
+        raise ManagerError("Testfehler")
+
+    warnings = []
+    monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", fail)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    window = MainWindow()
+    window.loaded(load_library(collection[0]))
+    window.compare_button.click()
+    window.comparison_page.start_button.click()
+    wait_for_window(window)
+    assert warnings and not window.comparison_page.running
+    assert window.comparison_page.start_button.isEnabled()
+    assert not window.comparison_page.cancel_button.isEnabled()
+    window.close()
+
+
+def test_track_comparison_disabled_without_library_and_sorts_numerically(qt_app, collection):
+    window = MainWindow()
+    wait_for_window(window)
+    window.compare_button.click()
+    assert not window.comparison_page.start_button.isEnabled()
+    library = load_library(collection[0])
+    model = ComparisonModel()
+    a, b, c = library.tracks
+    model.matches = (AudioMatch(a, b, 90.01), AudioMatch(b, c, 100.0))
+    model.refresh()
+    assert model.rows[0].similarity == 100
+    model.sort(0, Qt.SortOrder.AscendingOrder)
+    assert model.rows[0].similarity == 90.01
+    window.close()
 
 
 def test_successfully_loaded_path_is_persisted_and_reopened_at_start(qt_app, collection, window_settings):
@@ -375,7 +525,28 @@ def test_keeper_is_checkable_and_filter_keeps_complete_group(qt_app, collection)
     assert keeper not in plan.replacements
     model.keep(library.by_id["copy"])
     assert "copy" not in model.selected
-    assert model.keepers[library.by_id["copy"].duplicate_key] == "copy"
+    assert model.keepers[model.groups_by_track["copy"].recommended_id] == "copy"
+
+
+def test_separate_audio_groups_with_same_metadata_keep_independent_selections(qt_app, collection):
+    library = load_library(collection[0])
+    first, second = library.groups[0].tracks
+    third, fourth = replace(first, id="third", path="third.mp3"), replace(second, id="fourth", path="fourth.mp3")
+    groups = (DuplicateGroup(first.duplicate_key, (first, second), first.id, 95.1),
+              DuplicateGroup(first.duplicate_key, (third, fourth), third.id, 96.2))
+    library = replace(library, tracks=(first, second, third, fourth), groups=groups)
+    model = TrackModel()
+    model.set_library(library)
+    model.search = "third.mp3"
+    model.refresh()
+    assert {track.id for track in model.rows} == {"third", "fourth"}
+    model.apply_recommendations()
+    assert model.plan().replacements == {"fourth": "third"}
+    model.keep(fourth)
+    assert model.is_keeper(first) and model.is_keeper(fourth)
+    assert model.group_numbers[first.id] != model.group_numbers[third.id]
+    with pytest.raises(ManagerError, match="derselben Gruppe"):
+        validate_plan(library, RemovalPlan({second.id: "third"}))
 
 
 @pytest.mark.parametrize("apply_recommendations", [False, True])

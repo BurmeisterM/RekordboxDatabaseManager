@@ -102,6 +102,7 @@ def test_stale_library_is_not_modified(collection):
 def test_all_playlists_replace_removed_group_members_with_the_chosen_keeper(collection):
     path, conn = collection
     conn.execute("INSERT INTO djmdContent (ID,Title,ArtistID,BitRate) VALUES ('keeper','Searching Memory','artist',320)")
+    conn.execute("UPDATE djmdContent SET FolderPath=? WHERE ID='keeper'", (str(path.parent / "original.mp3"),))
     conn.executemany("INSERT INTO djmdPlaylist (ID) VALUES (?)", [("20",), ("30",)])
     conn.executemany("INSERT INTO djmdSongPlaylist (ID,PlaylistID,ContentID,TrackNo) VALUES (?,?,?,?)",
                      [("p3", "10", "copy", 3), ("p4", "20", "original", 1),
@@ -242,6 +243,7 @@ def test_two_entries_one_missing_file_and_one_recycled_is_not_a_failure(collecti
     path, conn = collection
     conn.execute("UPDATE djmdContent SET Title='Searching Memory' WHERE ID='remix'")
     conn.commit()
+    library = db.load_library(path)
     (path.parent / "copy.mp3").unlink()  # only the synthetic test file
 
     def recycle_test_file(file):
@@ -249,7 +251,6 @@ def test_two_entries_one_missing_file_and_one_recycled_is_not_a_failure(collecti
         file.unlink()  # simulate moving the synthetic file to the bin
 
     monkeypatch.setattr(db, "recycle_file", recycle_test_file)
-    library = db.load_library(path)
     result = db.remove_duplicates(library, RemovalPlan({"copy": "original", "remix": "original"}))
     assert result.removed == 2
     assert len(result.trashed) == 1
@@ -301,7 +302,7 @@ def test_missing_metadata_is_not_grouped_and_tombstones_are_hidden(collection):
     assert len(library.tracks) == 2 and not library.groups
 
 
-def test_real_testdata_on_an_isolated_copy(tmp_path, monkeypatch):
+def test_real_testdata_on_an_isolated_copy(tmp_path, monkeypatch, synthetic_mp3_audio):
     source = Path(__file__).resolve().parents[1] / "RecordBox Testdata" / "PIONEER" / "Master" / "master.db"
     if not source.is_file():
         pytest.skip("Local Rekordbox sample is not included in the repository")
@@ -315,8 +316,13 @@ def test_real_testdata_on_an_isolated_copy(tmp_path, monkeypatch):
     db.backup_database(source, copied, True)
     with closing(db.connect(copied, writable=True)) as conn:
         first = dict(conn.execute("SELECT * FROM djmdContent LIMIT 1").fetchone())
+        original_id = first["ID"]
         first["ID"] = "9876543210"
         first["UUID"] = "isolated-test-duplicate"
+        audio = tmp_path / "shared.mp3"
+        audio.write_bytes(synthetic_mp3_audio)
+        conn.execute("UPDATE djmdContent SET FolderPath=? WHERE ID=?", (str(audio), original_id))
+        first["FolderPath"] = str(audio)
         columns = ",".join(db.quote(c) for c in first)
         placeholders = ",".join("?" for _ in first)
         conn.execute(f"INSERT INTO djmdContent ({columns}) VALUES ({placeholders})", tuple(first.values()))
