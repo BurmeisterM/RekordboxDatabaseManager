@@ -1,6 +1,7 @@
 """Native Qt Widgets interface. Database and filesystem work runs off the UI thread."""
 
 from collections import OrderedDict
+from dataclasses import replace
 from pathlib import Path
 import os
 import sys
@@ -25,7 +26,7 @@ from .database import (
 )
 from .domain import Library, ManagerError, RemovalPlan, Track, display_date, normalize, validate_plan
 from .playback import AudioPreview
-from .comparison import compare_tracks
+from .comparison import compare_tracks, comparison_groups
 from .comparison_ui import ComparisonPage
 
 
@@ -282,13 +283,14 @@ class TrackModel(QAbstractTableModel):
         self.sort_column = 10
         self.sort_order = Qt.SortOrder.AscendingOrder
 
-    def set_library(self, library: Library):
+    def set_library(self, library: Library | None):
         self.library = library
         self.selected.clear()
-        self.keepers = {g.recommended_id: g.recommended_id for g in library.groups}
-        self.groups_by_track = {t.id: g for g in library.groups for t in g.tracks}
-        self.recommended = {g.recommended_id for g in library.groups}
-        self.group_numbers = {t.id: index for index, g in enumerate(library.groups, 1) for t in g.tracks}
+        groups = library.groups if library else ()
+        self.keepers = {g.recommended_id: g.recommended_id for g in groups}
+        self.groups_by_track = {t.id: g for g in groups for t in g.tracks}
+        self.recommended = {g.recommended_id for g in groups}
+        self.group_numbers = {t.id: index for index, g in enumerate(groups, 1) for t in g.tracks}
         self.covers = CoverCache()
         self.refresh()
 
@@ -605,13 +607,17 @@ class MainWindow(QMainWindow):
         self.last_backup: Path | None = None
         self.settings = app_settings()
         self.model = TrackModel()
-        self.model.selection_changed.connect(self.update_summary)
-        self.model.safety_warning.connect(self.show_safety_warning)
+        self.title_model = self.model
+        self.comparison_model = TrackModel()
+        for model in (self.title_model, self.comparison_model):
+            model.selection_changed.connect(self.update_summary)
+            model.safety_warning.connect(self.show_safety_warning)
         self.preview = AudioPreview(self)
         self._build()
         self.preview.changed.connect(self.preview_changed)
         self.preview.failed.connect(lambda message: QMessageBox.warning(self, "Hörprobe nicht möglich", message))
-        self.model.modelReset.connect(self.reset_details)
+        for model in (self.title_model, self.comparison_model):
+            model.modelReset.connect(self.reset_details)
         geometry = self.settings.value("geometry")
         if geometry:
             self.restoreGeometry(geometry)
@@ -686,9 +692,9 @@ class MainWindow(QMainWindow):
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(self.filter_rows)
         tools.addWidget(self.search, 1)
-        self.recommend_button = button("Vorschläge übernehmen", self.model.apply_recommendations)
+        self.recommend_button = button("Vorschläge übernehmen", lambda: self.model.apply_recommendations())
         self.recommend_button.setToolTip("Höchste Bitrate behalten; bei Gleichstand Titel mit Playlist-Zugehörigkeit bevorzugen. Wirkt auf sichtbare Gruppen.")
-        self.clear_button = button("Auswahl leeren", self.model.clear_selection)
+        self.clear_button = button("Auswahl leeren", lambda: self.model.clear_selection())
         tools.addWidget(self.recommend_button)
         tools.addWidget(self.clear_button)
         content.addLayout(tools)
@@ -786,12 +792,11 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.detail_scroll)
         self.splitter.setSizes([980, 250])
         content.addWidget(self.splitter, 1)
-        self.comparison_page = ComparisonPage()
+        self.comparison_page = ComparisonPage(self.comparison_model)
         self.comparison_page.start_requested.connect(self.start_comparison)
         self.comparison_page.cancel_requested.connect(self.cancel_comparison)
-        self.comparison_page.preview_requested.connect(self.preview.toggle)
         self.comparison_page.hide()
-        content.addWidget(self.comparison_page, 1)
+        content.insertWidget(content.indexOf(self.splitter), self.comparison_page)
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(False)
@@ -834,6 +839,7 @@ class MainWindow(QMainWindow):
 
     def set_view(self, duplicates_only):
         self.comparison_view = False
+        self.activate_model(self.title_model)
         self.comparison_page.hide()
         self.splitter.show()
         self.all_button.setChecked(not duplicates_only)
@@ -848,22 +854,31 @@ class MainWindow(QMainWindow):
         self.reset_details()
 
     def set_comparison_controls(self, comparison):
-        for widget in (self.recommend_button, self.clear_button, self.backup_button, self.remove_button,
-                       self.dupe_stat.parentWidget(), self.selected_stat.parentWidget()):
-            widget.setVisible(not comparison)
+        self.duplicate_notices.setVisible(bool(not comparison and self.model.duplicates_only
+                                              and self.library and self.library.duplicate_notices))
+
+    def activate_model(self, model):
+        self.model = model
+        self.model.search = self.search.text()
+        if self.table.model() is not model:
+            sort_column, sort_order = model.sort_column, model.sort_order
+            self.table.setModel(model)
+            self.table.selectionModel().currentRowChanged.connect(self.show_track)
+            self.table.sortByColumn(sort_column, sort_order)
+        self.reset_details()
 
     def set_comparison_view(self):
         self.comparison_view = True
+        self.activate_model(self.comparison_model)
         self.compare_button.setChecked(True)
-        self.splitter.hide()
+        self.splitter.show()
         self.comparison_page.show()
         self.set_comparison_controls(True)
         self.heading.setText("Trackvergleich")
         self.description.setText("MP3-Audiovergleich innerhalb desselben Interpreten: fünf Sekunden um die Dateimitte · mindestens 90 % Signalähnlichkeit. "
                                  "Treffer gelten für diesen Ausschnitt.")
         self.description.setWordWrap(True)
-        self.comparison_page.model.search = self.search.text()
-        self.comparison_page.model.refresh()
+        self.model.refresh()
         self.update_summary()
 
     def start_comparison(self):
@@ -874,9 +889,19 @@ class MainWindow(QMainWindow):
         cancel = self.comparison_cancel
         self.comparison_page.start()
 
-        def completed(result):
+        def compare(report):
+            result = compare_tracks(tracks, cancel, report)
+            groups = comparison_groups(result)
+            if cancel.is_set():
+                result = replace(result, matches=(), cancelled=True)
+                groups = ()
+            return result, groups
+
+        def completed(output):
+            result, groups = output
             self.comparison_cancel = None
-            self.comparison_page.finish(result)
+            self.comparison_page.finish(result, replace(self.library, groups=groups))
+            self.reset_details()
             self.status_label.setText(self.comparison_page.status.text())
             self.update_summary()
 
@@ -886,7 +911,7 @@ class MainWindow(QMainWindow):
             self.comparison_page.status.setText("Trackvergleich fehlgeschlagen: " + message)
             self.task_failed(message)
 
-        self.run_task(lambda report: compare_tracks(tracks, cancel, report), completed,
+        self.run_task(compare, completed,
                       "Trackvergleich läuft · Audioausschnitte werden nur gelesen …", failure=failed,
                       progress=self.comparison_page.report_progress)
 
@@ -898,8 +923,6 @@ class MainWindow(QMainWindow):
         self.model.search = text
         self.model.refresh()
         self.reset_details()
-        self.comparison_page.model.search = text
-        self.comparison_page.model.refresh()
         self.update_summary()
 
     def choose_database(self):
@@ -949,7 +972,7 @@ class MainWindow(QMainWindow):
         self.run_task(read_remembered, startup_loaded, "Gespeicherter Pfad und Rekordbox-Einstellungen werden geprüft…")
 
     def open_database(self, path, *, discovered=False):
-        if self.model.selected:
+        if self.title_model.selected or self.comparison_model.selected:
             answer = QMessageBox.question(self, "Auswahl verwerfen?", "Die aktuelle Markierung zum Entfernen verwerfen und die Datenbank laden?",
                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                                           QMessageBox.StandardButton.No)
@@ -971,9 +994,9 @@ class MainWindow(QMainWindow):
         self.preview.stop()
         self.library = library
         self.comparison_page.reset()
-        self.model.set_library(library)
+        self.title_model.set_library(library)
         self.duplicate_notices.setPlainText("Nicht prüfbare Duplikatkandidaten:\n\n" + "\n\n".join(library.duplicate_notices))
-        self.duplicate_notices.setVisible(bool(self.model.duplicates_only and library.duplicate_notices))
+        self.duplicate_notices.setVisible(bool(not self.comparison_view and self.model.duplicates_only and library.duplicate_notices))
         self.path_label.setText(str(library.path))
         self.path_label.setToolTip(str(library.path))
         self.settings.setValue("last_database", str(library.path))
@@ -1024,7 +1047,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not self.busy)
         self.comparison_page.set_available(bool(self.library), self.busy)
         self.reload_button.setEnabled(bool(self.library) and not self.busy)
-        self.recommend_button.setEnabled(bool(self.library and self.library.groups) and not self.busy)
+        self.recommend_button.setEnabled(bool(self.library and self.model.library and self.model.library.groups) and not self.busy)
         self.clear_button.setEnabled(bool(self.model.selected) and not self.busy)
         self.remove_button.setEnabled(bool(self.model.selected) and not self.busy)
         self.keep_button.setEnabled(self.current_track() is not None and not self.busy and
@@ -1037,7 +1060,7 @@ class MainWindow(QMainWindow):
         count = len(self.model.selected)
         if self.library:
             self.total_stat.setText(f"{len(self.library.tracks):,}".replace(",", "."))
-            self.dupe_stat.setText(str(len(self.library.groups)))
+            self.dupe_stat.setText(str(len(self.model.library.groups) if self.model.library else 0))
             self.selected_stat.setText(str(count))
             visible = {t.id for t in self.model.rows}
             hidden = len(self.model.selected - visible)
@@ -1045,10 +1068,13 @@ class MainWindow(QMainWindow):
                                  + (f" · davon {hidden} außerhalb des Filters" if hidden else ""))
             if not self.model.rows:
                 self.empty_label.setText("Keine Treffer für diesen Filter." if self.search.text() else
+                                         "Keine Trackgruppen gefunden. Starte einen Trackvergleich." if self.comparison_view else
                                          "Keine doppelten Titel gefunden." if self.model.duplicates_only else "Diese Sammlung enthält keine Titel.")
+        else:
+            self.summary.setText("Noch keine Sammlung geöffnet.")
         self.empty_label.setVisible(not self.model.rows)
         if self.comparison_view:
-            self.summary.setText(f"{len(self.comparison_page.model.rows)} Trefferpaare angezeigt · Mindestähnlichkeit 90 %")
+            self.summary.setText(self.summary.text() + " · Mindestähnlichkeit 90 %")
         self.set_controls()
 
     def current_track(self):
@@ -1175,7 +1201,7 @@ class MainWindow(QMainWindow):
     def review_removal(self):
         if not self.library or not self.model.selected:
             return
-        library = self.library
+        library = self.model.library
         try:
             plan = self.model.plan()
         except ManagerError as exc:
@@ -1239,8 +1265,9 @@ class MainWindow(QMainWindow):
             "Nur Gruppen mit mehr als 90 % Signalähnlichkeit werden als Duplikate angezeigt. "
             "Nicht lesbare, zu kurze oder stille Kandidaten werden mit Grund ausgelassen.\n\n"
             "Trackvergleich: Nur MP3-Dateien desselben Interpreten werden verglichen. Je Datei werden fünf Sekunden um die tatsächliche Mitte "
-            "verglichen. Trefferpaare ab 90 % Signalähnlichkeit erscheinen mit beiden Dateipfaden. "
-            "Track A/B anhören ermöglicht das Prüfen. Stille, zu kurze und unlesbare Dateien werden mit Grund übersprungen.\n\n"
+            "verglichen. Treffer ab 90 % erscheinen in Gruppen mit denselben Funktionen wie beim Titelvergleich. "
+            "Alle Mitglieder einer Gruppe stimmen untereinander überein. "
+            "„Fehlerhafte Dateien drucken“ öffnet eine Druckvorschau mit vollständigen Pfaden und Fehlergründen.\n\n"
             "Vorschläge übernehmen wirkt auf sichtbare Gruppen; eine gefilterte Duplikatgruppe bleibt vollständig sichtbar. "
             "Markierungen außerhalb des Filters werden in der Fußzeile gezählt und vor dem Entfernen ebenfalls angezeigt.\n\n"
             "Vor Änderungen Rekordbox und Rekordbox Agent schließen. Musikdateien werden beim Entfernen automatisch "

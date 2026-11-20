@@ -1,76 +1,26 @@
-"""Track comparison results and controls, kept separate from removal selections."""
+"""Controls and printable error report for the shared track results view."""
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, Qt, Signal
+from datetime import datetime
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QTextDocument, QTextOption
+from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit,
-    QProgressBar, QPushButton, QTableView, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QPlainTextEdit, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
-
-from .domain import normalize
-
-
-class ComparisonModel(QAbstractTableModel):
-    HEADERS = ("Ähnlichkeit", "Titel A", "Interpret A", "Datei A", "Titel B", "Interpret B", "Datei B")
-
-    def __init__(self):
-        super().__init__()
-        self.matches = ()
-        self.rows = []
-        self.search = ""
-        self.sort_column = 0
-        self.sort_order = Qt.SortOrder.DescendingOrder
-
-    def refresh(self):
-        self.beginResetModel()
-        needle = normalize(self.search)
-        self.rows = [match for match in self.matches if not needle or needle in normalize(
-            " ".join((match.first.title, match.first.artist, match.first.path,
-                      match.second.title, match.second.artist, match.second.path)))]
-        self.rows.sort(key=lambda match: self.values(match)[self.sort_column],
-                       reverse=self.sort_order == Qt.SortOrder.DescendingOrder)
-        self.endResetModel()
-
-    @staticmethod
-    def values(match):
-        return (match.similarity, match.first.title, match.first.artist, match.first.path,
-                match.second.title, match.second.artist, match.second.path)
-
-    def rowCount(self, parent=QModelIndex()):
-        return 0 if parent.isValid() else len(self.rows)
-
-    def columnCount(self, parent=QModelIndex()):
-        return len(self.HEADERS)
-
-    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.HEADERS[section]
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if not index.isValid():
-            return None
-        match = self.rows[index.row()]
-        if role == Qt.ItemDataRole.DisplayRole:
-            return f"{match.similarity:.2f} %" if index.column() == 0 else self.values(match)[index.column()]
-        if role == Qt.ItemDataRole.ToolTipRole:
-            return (f"{match.similarity:.4f} % Signalähnlichkeit im mittleren Fünf-Sekunden-Ausschnitt\n\n"
-                    f"A · ID {match.first.id}\n{match.first.path}\n\n"
-                    f"B · ID {match.second.id}\n{match.second.path}")
-
-    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
-        self.sort_column, self.sort_order = column, order
-        self.refresh()
 
 
 class ComparisonPage(QWidget):
     start_requested = Signal()
     cancel_requested = Signal()
-    preview_requested = Signal(object)
 
-    def __init__(self):
+    def __init__(self, model):
         super().__init__()
         self.result = None
         self.running = False
-        self.model = ComparisonModel()
+        self.model = model
+        self.library_path = ""
+        self.finished_at = ""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         toolbar = QHBoxLayout()
@@ -83,12 +33,10 @@ class ComparisonPage(QWidget):
         toolbar.addWidget(self.start_button)
         toolbar.addWidget(self.cancel_button)
         toolbar.addStretch()
-        self.preview_first = QPushButton("Track A anhören")
-        self.preview_second = QPushButton("Track B anhören")
-        self.preview_first.clicked.connect(lambda: self.preview_match(True))
-        self.preview_second.clicked.connect(lambda: self.preview_match(False))
-        toolbar.addWidget(self.preview_first)
-        toolbar.addWidget(self.preview_second)
+        self.print_button = QPushButton("Fehlerhafte Dateien drucken…")
+        self.print_button.setToolTip("Druckvorschau mit Titel, Interpret, ID, vollständigem Dateipfad und Fehlergrund öffnen.")
+        self.print_button.clicked.connect(self.print_errors)
+        toolbar.addWidget(self.print_button)
         layout.addLayout(toolbar)
         self.status = QLabel()
         self.status.setWordWrap(True)
@@ -97,36 +45,22 @@ class ComparisonPage(QWidget):
         self.progress = QProgressBar()
         self.progress.hide()
         layout.addWidget(self.progress)
-        self.table = QTableView()
-        self.table.setModel(self.model)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setWordWrap(False)
-        self.table.setAlternatingRowColors(True)
-        self.table.verticalHeader().hide()
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        for col in range(self.model.columnCount()):
-            self.table.setColumnWidth(col, 105 if col == 0 else 190)
-        self.table.setSortingEnabled(True)
-        self.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
-        self.table.selectionModel().currentRowChanged.connect(self.update_preview)
-        self.model.modelReset.connect(self.update_preview)
-        layout.addWidget(self.table, 1)
         self.notices = QPlainTextEdit()
         self.notices.setReadOnly(True)
-        self.notices.setMaximumHeight(120)
+        self.notices.setMaximumHeight(100)
         self.notices.setAccessibleName("Übersprungene Dateien beim Trackvergleich")
         layout.addWidget(self.notices)
         self.reset()
 
     def reset(self):
         self.result = None
-        self.model.matches = ()
-        self.model.refresh()
+        self.library_path = ""
+        self.finished_at = ""
+        self.model.set_library(None)
         self.status.setText("Noch kein Trackvergleich durchgeführt. Verglichen werden nur MP3-Dateien desselben Interpreten in der geöffneten Sammlung.")
         self.notices.clear()
         self.notices.hide()
+        self.print_button.setEnabled(False)
 
     def start(self):
         self.reset()
@@ -149,17 +83,19 @@ class ComparisonPage(QWidget):
         if self.cancel_button.isEnabled():
             self.status.setText(message)
 
-    def finish(self, result):
+    def finish(self, result, library):
         self.stop()
         self.result = result
-        self.model.matches = result.matches
-        self.model.refresh()
-        count = len({track.id for match in result.matches for track in (match.first, match.second)})
+        self.library_path = str(library.path)
+        self.finished_at = datetime.now().astimezone().strftime("%d.%m.%Y %H:%M %Z")
+        self.model.set_library(library)
+        count = sum(len(group.tracks) for group in library.groups)
         self.status.setText("Trackvergleich abgebrochen. Keine unvollständigen Ergebnisse übernommen." if result.cancelled else
-                            f"{len(result.matches)} Trefferpaare mit mindestens 90 % · {count} Tracks · "
-                            f"{result.checked} Titel geprüft · {len(result.skipped)} übersprungen")
+                            f"{len(library.groups)} Gruppen · {count} Tracks · {len(result.matches)} Trefferpaare mit mindestens 90 % · "
+                            f"{result.checked} Titel geprüft · {len(result.skipped)} übersprungen · {len(result.errors)} Dateifehler")
         self.notices.setPlainText("Übersprungene Dateien:\n\n" + "\n\n".join(result.skipped))
         self.notices.setVisible(bool(result.skipped))
+        self.print_button.setEnabled(bool(result.errors))
 
     def stop(self):
         self.running = False
@@ -168,16 +104,32 @@ class ComparisonPage(QWidget):
 
     def set_available(self, has_library, busy):
         self.start_button.setEnabled(has_library and not busy)
-        self.table.setEnabled(not busy)
-        self.update_preview()
+        self.print_button.setEnabled(bool(self.result and self.result.errors) and not busy)
 
-    def update_preview(self, *args):
-        enabled = self.table.isEnabled() and self.table.currentIndex().isValid()
-        self.preview_first.setEnabled(enabled)
-        self.preview_second.setEnabled(enabled)
+    def error_document(self):
+        document = QTextDocument()
+        document.setDefaultFont(QFont("Segoe UI", 10))
+        option = document.defaultTextOption()
+        option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+        document.setDefaultTextOption(option)
+        errors = self.result.errors if self.result else ()
+        heading = ("Rekordbox Database Manager – Fehlerhafte Dateien\n\n"
+                   f"Sammlung: {self.library_path}\nTrackvergleich vom {self.finished_at}\n"
+                   f"{len(errors)} fehlerhafte Dateieinträge\n")
+        if self.result and self.result.cancelled:
+            heading += "Vergleich abgebrochen – diese Liste enthält nur die bis dahin erkannten Dateifehler.\n"
+        document.setPlainText(heading + "\n" + "\n\n".join(
+            f"{index}. {error}" for index, error in enumerate(errors, 1)))
+        return document
 
-    def preview_match(self, first):
-        index = self.table.currentIndex()
-        if index.isValid() and self.table.isEnabled():
-            match = self.model.rows[index.row()]
-            self.preview_requested.emit(match.first if first else match.second)
+    def print_errors(self):
+        if not self.result or not self.result.errors:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        printer.setDocName("Trackvergleich – Fehlerhafte Dateien")
+        document = self.error_document()
+        preview = QPrintPreviewDialog(printer, self)
+        preview.setWindowTitle("Fehlerhafte Dateien – Druckvorschau")
+        preview.resize(1000, 750)
+        preview.paintRequested.connect(document.print_)
+        preview.exec()

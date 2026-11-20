@@ -10,13 +10,13 @@ import numpy as np
 from PySide6.QtCore import QPoint, Qt, QThread
 from PySide6.QtGui import QColor, QPalette
 from PySide6.QtTest import QTest
+from PySide6.QtPrintSupport import QPrinter, QPrintPreviewDialog
 from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QFileDialog, QLineEdit, QMessageBox, QStyleOptionViewItem
 
 from rekordbox_manager.database import load_library
 from rekordbox_manager.domain import DuplicateGroup, ManagerError, RemovalPlan, validate_plan
 from rekordbox_manager.ui import MainWindow, RemovalDialog, Task, TrackModel, app_settings
 from rekordbox_manager.comparison import AudioMatch, ComparisonResult, compare_tracks
-from rekordbox_manager.comparison_ui import ComparisonModel
 
 
 @pytest.fixture(autouse=True)
@@ -76,31 +76,32 @@ def test_track_comparison_menu_and_background_scan(qt_app, collection, tmp_path,
     selected = set(window.model.selected)
     window.compare_button.click()
     assert window.heading.text() == "Trackvergleich" and window.compare_button.isChecked()
-    assert window.splitter.isHidden() and not window.comparison_page.isHidden()
-    assert window.remove_button.isHidden()
+    assert not window.splitter.isHidden() and not window.comparison_page.isHidden()
+    assert not window.remove_button.isHidden()
     window.comparison_page.start_button.click()
     assert window.busy and window.comparison_page.cancel_button.isEnabled()
     assert not window.reload_button.isEnabled()
     wait_for_window(window)
     page = window.comparison_page
     assert threads and threads[0] != qt_app.thread()
-    assert len(page.model.rows) == 1 and page.model.rows[0].similarity > 99.9
-    assert page.model.columnCount() == 7
+    assert len(page.model.rows) == 2 and page.model.library.groups[0].similarity > 99.9
+    assert page.model.columnCount() == window.title_model.columnCount()
     assert "1 Trefferpaare" in page.status.text()
-    assert window.model.selected == selected
+    assert not window.model.selected and window.title_model.selected == selected
     window.search.setText("not present")
-    assert page.model.rowCount() == 0 and "0 Trefferpaare" in window.summary.text()
+    assert page.model.rowCount() == 0 and "0 Titel" in window.summary.text()
     window.search.clear()
-    assert page.model.rowCount() == 1
-    page.table.setCurrentIndex(page.model.index(0, 0))
+    assert page.model.rowCount() == 2
+    window.table.setCurrentIndex(page.model.index(0, 0))
     heard = []
-    page.preview_requested.connect(heard.append)
-    # Inspect the selected pair without invoking a playback backend in this test.
-    page.preview_requested.disconnect(window.preview.toggle)
-    page.preview_first.click()
-    page.preview_second.click()
-    assert heard == [page.model.rows[0].first, page.model.rows[0].second]
+    monkeypatch.setattr(window.preview, "toggle", heard.append)
+    window.cover_clicked(page.model.index(0, 1))
+    window.cover_clicked(page.model.index(1, 1))
+    assert heard == page.model.rows
+    window.recommend_button.click()
+    assert len(window.model.plan().replacements) == 1
     window.all_button.click()
+    assert window.model.selected == selected
     assert not window.comparison_view and not window.splitter.isHidden()
     assert window.comparison_page.isHidden() and not window.remove_button.isHidden()
     window.loaded(library)
@@ -120,7 +121,73 @@ def test_track_comparison_reports_unreadable_files(qt_app, collection):
     assert len(page.result.skipped) == 3
     assert "3 übersprungen" in page.status.text()
     assert not page.notices.isHidden() and "original.mp3" in page.notices.toPlainText()
+    assert len(page.result.errors) == 3 and page.print_button.isEnabled()
     assert page.start_button.isEnabled() and not page.cancel_button.isEnabled()
+    window.close()
+
+
+def test_track_comparison_print_button_renders_full_error_report(qt_app, collection, tmp_path, monkeypatch):
+    window = MainWindow()
+    window.loaded(load_library(collection[0]))
+    page = window.comparison_page
+    errors = tuple(f'Titel <{i}> & Künstler · ID {i} · C:/' + 'Langer Pfad/' * 20 + f'{i}.mp3\nDatei nicht lesbar.'
+                   for i in range(40))
+    page.finish(ComparisonResult(errors=errors, cancelled=True), replace(window.library, groups=()))
+    report = page.error_document().toPlainText()
+    assert str(collection[0]) in report and page.finished_at in report
+    assert "Vergleich abgebrochen" in report and "40 fehlerhafte" in report
+    assert errors[0] in report and errors[-1] in report
+    output = tmp_path / "Fehlerliste.pdf"
+
+    def render(preview):
+        printer = preview.printer()
+        printer.setOutputFormat(QPrinter.OutputFormat.PdfFormat)
+        printer.setOutputFileName(str(output))
+        preview.paintRequested.emit(printer)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(QPrintPreviewDialog, "exec", render)
+    page.print_button.click()
+    assert output.read_bytes().startswith(b"%PDF-") and output.stat().st_size > 1000
+    window.loaded(window.library)
+    assert not page.print_button.isEnabled() and page.result is None
+    window.close()
+
+
+def test_track_comparison_removal_uses_audio_groups_and_preserves_playlist_positions(qt_app, collection, monkeypatch):
+    path, conn = collection
+    window = MainWindow()
+    window.loaded(load_library(path))
+    assert len(window.library.groups[0].tracks) == 2
+    window.compare_button.click()
+    window.comparison_page.start_button.click()
+    wait_for_window(window)
+    assert len(window.model.library.groups) == 1 and len(window.model.rows) == 3
+    # The remix has a different title and is absent from the title duplicate group.
+    retained = window.library.by_id["remix"]
+    window.model.keep(retained)
+    for track in tuple(window.model.rows):
+        if track.id != retained.id:
+            row = window.model.rows.index(track)
+            window.model.setData(window.model.index(row, 0), Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
+    plan = window.model.plan()
+    assert plan.replacements == {"copy": "remix", "original": "remix"}
+    reviewed = []
+
+    def accept(dialog):
+        reviewed.append(dialog.library)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(RemovalDialog, "exec", accept)
+    monkeypatch.setattr(QMessageBox, "exec", lambda box: QMessageBox.StandardButton.Ok)
+    window.remove_button.click()
+    wait_for_window(window)
+    assert reviewed and len(reviewed[0].groups[0].tracks) == 3
+    assert [row[0] for row in conn.execute("SELECT ID FROM djmdContent")] == ["remix"]
+    assert conn.execute("SELECT ContentID, TrackNo FROM djmdSongPlaylist ORDER BY TrackNo").fetchall() == [
+        ("remix", 1), ("remix", 2)]
+    assert not window.comparison_model.rows and window.comparison_page.result is None
+    assert not window.title_model.selected
     window.close()
 
 
@@ -164,19 +231,12 @@ def test_track_comparison_failure_restores_controls(qt_app, collection, monkeypa
     window.close()
 
 
-def test_track_comparison_disabled_without_library_and_sorts_numerically(qt_app, collection):
+def test_track_comparison_disabled_without_library(qt_app):
     window = MainWindow()
     wait_for_window(window)
     window.compare_button.click()
     assert not window.comparison_page.start_button.isEnabled()
-    library = load_library(collection[0])
-    model = ComparisonModel()
-    a, b, c = library.tracks
-    model.matches = (AudioMatch(a, b, 90.01), AudioMatch(b, c, 100.0))
-    model.refresh()
-    assert model.rows[0].similarity == 100
-    model.sort(0, Qt.SortOrder.AscendingOrder)
-    assert model.rows[0].similarity == 90.01
+    assert not window.comparison_page.print_button.isEnabled()
     window.close()
 
 
@@ -375,12 +435,17 @@ def edit_title(window, track_id):
     return editors[0]
 
 
-@pytest.mark.parametrize("duplicates_only", [True, False])
-def test_double_click_title_and_return_save_database_and_rename_audio(qt_app, collection, monkeypatch, duplicates_only):
+@pytest.mark.parametrize("view", ["duplicates", "all", "comparison"])
+def test_double_click_title_and_return_save_database_and_rename_audio(qt_app, collection, monkeypatch, view):
     path, _ = collection
     window = MainWindow()
     window.loaded(load_library(path))
-    window.set_view(duplicates_only)
+    if view == "comparison":
+        window.set_comparison_view()
+        window.comparison_page.start_button.click()
+        wait_for_window(window)
+    else:
+        window.set_view(view == "duplicates")
     window.model.apply_recommendations()
     assert window.model.selected
     warnings = []
@@ -403,7 +468,7 @@ def test_double_click_title_and_return_save_database_and_rename_audio(qt_app, co
     assert window.last_backup is None
     assert not path.with_name("RekordboxManager-Backups").exists()
     assert "Titel gespeichert" in window.status_label.text()
-    if not duplicates_only:
+    if view == "all":
         assert window.current_track().id == "copy"
         assert window.detail_title.text() == "Neuer Titel"
         assert window.detail_filename.text() == "Crown (ARG) - Neuer Titel.mp3"

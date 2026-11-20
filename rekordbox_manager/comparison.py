@@ -9,7 +9,7 @@ from threading import Event
 import av
 import numpy as np
 
-from .domain import DuplicateGroup, ManagerError, Track, normalize
+from .domain import DuplicateGroup, ManagerError, Track, normalize, recommendation_rank
 
 
 SAMPLE_RATE = 8000
@@ -42,6 +42,30 @@ class ComparisonResult:
     skipped: tuple[str, ...] = ()
     checked: int = 0
     cancelled: bool = False
+    errors: tuple[str, ...] = ()
+
+
+def comparison_groups(result: ComparisonResult) -> tuple[DuplicateGroup, ...]:
+    """Build disjoint groups whose members all match, with deterministic keepers."""
+    if result.cancelled:
+        return ()
+    scores = {frozenset((m.first.id, m.second.id)): m.similarity for m in result.matches}
+    tracks = {t.id: t for m in result.matches for t in (m.first, m.second)}
+    partitions = []
+    for track in sorted(tracks.values(), key=recommendation_rank):
+        for partition in partitions:
+            if all(scores.get(frozenset((track.id, other.id)), 0) >= MIN_SIMILARITY
+                   for other in partition):
+                partition.append(track)
+                break
+        else:
+            partitions.append([track])
+    return tuple(
+        DuplicateGroup(("audio", partition[0].id), tuple(partition), partition[0].id,
+                       min(scores[frozenset((first.id, second.id))]
+                           for index, first in enumerate(partition) for second in partition[index + 1:]))
+        for partition in partitions if len(partition) > 1
+    )
 
 
 def read_middle(path: Path, cancel: Event) -> np.ndarray:
@@ -133,7 +157,7 @@ def compare_tracks(tracks: tuple[Track, ...], cancel: Event, progress=None) -> C
 
 
 def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, strict=False):
-    matches, skipped, checked = [], [], 0
+    matches, skipped, errors, checked = [], [], [], 0
     report = progress or (lambda current, total, message: None)
     try:
         with TemporaryDirectory(prefix="rekordbox-trackvergleich-") as directory:
@@ -142,13 +166,16 @@ def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, stri
             for index, track in enumerate(tracks):
                 check_cancelled(cancel)
                 report(index, len(tracks), f"Audio lesen: {index + 1}/{len(tracks)} · {track.title}")
+                file_error = True
                 try:
                     if not track.path:
                         raise ManagerError("Kein Musikdateipfad vorhanden.")
                     if mp3_only and Path(track.path).suffix.casefold() != ".mp3":
+                        file_error = False
                         raise ManagerError("Nur MP3-Dateien werden verglichen.")
                     key_for_group = group_key(track)
                     if not key_for_group:
+                        file_error = False
                         raise ManagerError("Kein Interpret vorhanden.")
                     path = Path(track.path).resolve(strict=True)
                     if path not in paths:
@@ -160,7 +187,10 @@ def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, stri
                     artists.setdefault(key_for_group, []).append((track, paths[path]))
                     checked += 1
                 except (ManagerError, OSError) as exc:
-                    skipped.append(f"{track.title or 'Ohne Titel'} · ID {track.id} · {track.path}\n{exc}")
+                    notice = f"{track.title or 'Ohne Titel'} · {track.artist or 'Unbekannter Interpret'} · ID {track.id} · {track.path}\n{exc}"
+                    skipped.append(notice)
+                    if file_error:
+                        errors.append(notice)
 
             @lru_cache(maxsize=32)
             def load(key):
@@ -186,8 +216,9 @@ def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, stri
                 load.cache_clear()
     except ComparisonCancelled:
         # Discard partial matches so they cannot be mistaken for a complete scan.
-        return ComparisonResult(skipped=tuple(skipped), checked=checked, cancelled=True)
-    return ComparisonResult(tuple(sorted(matches, key=lambda match: -match.similarity)), tuple(skipped), checked)
+        return ComparisonResult(skipped=tuple(skipped), checked=checked, cancelled=True, errors=tuple(errors))
+    return ComparisonResult(tuple(sorted(matches, key=lambda match: -match.similarity)), tuple(skipped), checked,
+                            errors=tuple(errors))
 
 
 def verify_duplicate_groups(groups: tuple[DuplicateGroup, ...], cancel: Event | None = None,

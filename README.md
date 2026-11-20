@@ -6,7 +6,7 @@ Deutsche Windows-Desktop-App zur Verwaltung der Rekordbox-`master.db`. Die Daten
 
 ### Mit Setup installieren (empfohlen)
 
-Die vollständige Installationsdatei liegt unter **`dist/Setup/RekordboxDatabaseManager-1.1.1-Setup-x64.exe`**. Zum Weitergeben reicht diese einzelne Datei. Sie enthält das Programm einschließlich Python, Qt, SQLCipher und aller weiteren Laufzeitbibliotheken; auf dem Zielrechner sind weder Python noch ein Internetzugang für die Installation erforderlich.
+Die vollständige Installationsdatei liegt unter **`dist/Setup/RekordboxDatabaseManager-1.1.2-Setup-x64.exe`**. Zum Weitergeben reicht diese einzelne Datei. Sie enthält das Programm einschließlich Python, Qt, SQLCipher und aller weiteren Laufzeitbibliotheken; auf dem Zielrechner sind weder Python noch ein Internetzugang für die Installation erforderlich.
 
 1. Die Setup-Datei auf einem Windows-PC mit 64 Bit öffnen (Windows 10 ab Version 1809 oder Windows 11).
 2. Den Installationsordner wählen und bei Bedarf **Desktopverknüpfung erstellen** aktivieren. Die Installation erfolgt für den aktuellen Benutzer und benötigt keine Administratorrechte.
@@ -16,7 +16,9 @@ Standardmäßig wird unter `%LOCALAPPDATA%\Programs\Rekordbox Database Manager` 
 
 ### Ohne Installation starten
 
-Die aktuelle Anwendung liegt unter `dist/RekordboxDatabaseManager-1.1.1/RekordboxDatabaseManager.exe`. Python ist dafür nicht erforderlich. Zum Weitergeben den **gesamten Versionsordner** kopieren, einschließlich `_internal`. Neue Builds erhalten einen eigenen Versionsordner, damit eine laufende ältere Instanz nicht überschrieben wird.
+Die aktuelle Anwendung liegt unter `dist/RekordboxDatabaseManager-1.1.2/RekordboxDatabaseManager.exe`. Python ist dafür nicht erforderlich. Zum Weitergeben den **gesamten Versionsordner** kopieren, einschließlich `_internal`. Neue Builds erhalten einen eigenen Versionsordner, damit eine laufende ältere Instanz nicht überschrieben wird.
+
+Version 1.1.2 zeigt den Trackvergleich in derselben Tabelle wie den Titelvergleich: mit farbigen Gruppen, Cover-Hörprobe, Titelbearbeitung, Playlist-Anzeige, Behalten-Empfehlung und geprüfter Entfernung. **Fehlerhafte Dateien drucken…** öffnet eine Druckvorschau mit vollständigen Dateipfaden und Fehlergründen.
 
 Version 1.1.1 ignoriert bei der Duplikat-Vorauswahl + und & im Interpreten sowie (Original) im Titel und bestätigt Kandidaten anhand des mittleren Fünf-Sekunden-Ausschnitts mit mehr als 90 % Signalähnlichkeit. Der separate Trackvergleich ist auf MP3-Dateien desselben Interpreten begrenzt.
 
@@ -73,8 +75,9 @@ Die Tabelle zeigt die Spalten in dieser Reihenfolge: **Gruppe, Entfernen, Cover,
 
 1. Eine Sammlung öffnen und links **Trackvergleich** wählen.
 2. **Trackvergleich starten** anklicken. Die Suche vergleicht nur MP3-Dateien innerhalb desselben Interpreten der geöffneten Sammlung, unabhängig vom Titel und dem Textfilter. Beim Interpreten werden Groß-/Kleinschreibung, Unicode-Schreibvarianten und überzählige Leerzeichen ignoriert. Andere Formate und Titel ohne Interpret werden mit Grund übersprungen. Die tatsächliche Dateidauer bestimmt die Mitte; die Dauerangabe in der Datenbank wird dafür nicht verwendet.
-3. Die Liste zeigt jedes Trefferpaar ab **90 %** mit Ähnlichkeitswert, Titel, Interpret und vollständigem Dateipfad für Track A und B. Beide Tracks lassen sich über **Track A anhören** und **Track B anhören** prüfen. Der Textfilter sucht in beiden Tracks; ein Treffer zeigt immer das ganze Paar. Spaltenköpfe sortieren die Ergebnisse.
+3. Treffer ab **90 %** erscheinen wie beim Titelvergleich als einzelne Tracks in farbigen, nummerierten Gruppen. Alle Mitglieder einer Gruppe erreichen untereinander mindestens 90 %; bloße Trefferketten werden nicht zusammengefasst. Jede Track-ID erscheint höchstens einmal. Bei überlappenden Trefferpaaren werden die Gruppen nach der Behalten-Priorität gebildet; einzelne verbleibende Tracks erscheinen nicht als Gruppe. Die Spalte **Auswahl** und die Titeldetails zeigen die niedrigste Ähnlichkeit innerhalb der Gruppe. Cover-Hörprobe, Playlist-Dropdown, Titelbearbeitung per Doppelklick, **Diesen Titel behalten**, **Vorschläge übernehmen**, Lösch-Markierungen und **Auswahl prüfen & entfernen** funktionieren wie beim Titelvergleich. Der Textfilter zeigt bei einem Treffer die gesamte Gruppe. Titel- und Trackvergleich behalten beim Ansichtswechsel jeweils ihre eigenen Markierungen; Entfernen bezieht sich auf die aktive Ansicht.
 4. **Abbrechen** beendet die Suche. Unvollständige Treffer werden verworfen; die Suche kann danach erneut gestartet werden. Übersprungene Dateien samt Gründen stehen unter der Liste. Beim Neuladen oder Ändern der Sammlung werden alte Vergleichsergebnisse verworfen.
+5. **Fehlerhafte Dateien drucken…** öffnet eine Druckvorschau mit Sammlung, Zeitpunkt, Titel, Interpret, ID, vollständigem Dateipfad und Fehlergrund. Die Liste enthält alle erkannten Dateifehler unabhängig vom Textfilter. Andere Formate und fehlende Interpreten werden nur als übersprungen gemeldet. Nach einem Abbruch weist die Druckliste auf den unvollständigen Prüflauf hin. Ohne Dateifehler bleibt der Button deaktiviert.
 
 Das Vergleichsfenster ist um die Mitte zentriert: Bei vier Minuten Dateidauer wird der Bereich von 1:57,5 bis 2:02,5 ausgewertet. PyAV/FFmpeg dekodiert den Ausschnitt als Mono mit 8 kHz. Der Vergleich verwendet eine normalisierte Kreuzkorrelation, gleicht die Lautstärke aus und toleriert bis zu 250 Millisekunden Zeitversatz sowie umgekehrte Signalpolarität. Die Prozentzahl beschreibt die Signalähnlichkeit des Ausschnitts, keine Wahrscheinlichkeit für die Identität des gesamten Tracks. Unterschiedliche Intros, Abspielgeschwindigkeiten oder deutlich bearbeitete Aufnahmen können trotz gleicher Musik zu anderen Ergebnissen führen. **Doppelte Titel** verwendet dasselbe Audioverfahren nach der Metadaten-Vorauswahl mit dem strengeren Grenzwert **über 90 %**.
 

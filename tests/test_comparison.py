@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from rekordbox_manager.comparison import (
-    ComparisonCancelled, MIN_SIMILARITY, SAMPLE_COUNT, SAMPLE_RATE, compare_tracks, read_middle,
-    signature, similarity, verify_duplicate_groups,
+    AudioMatch, ComparisonCancelled, ComparisonResult, MIN_SIMILARITY, SAMPLE_COUNT, SAMPLE_RATE,
+    compare_tracks, comparison_groups, read_middle, signature, similarity, verify_duplicate_groups,
 )
 from rekordbox_manager.domain import ManagerError, Track, find_duplicates
 
@@ -96,8 +96,29 @@ def test_skips_other_formats_and_missing_artists_before_reading_audio(tmp_path, 
     result = compare_tracks(tracks, Event())
     assert not result.matches and result.checked == 0
     assert len(result.skipped) == 4
+    assert not result.errors
     assert all("Nur MP3" in reason for reason in result.skipped[:2])
     assert all("Kein Interpret" in reason for reason in result.skipped[2:])
+
+
+def test_track_groups_are_disjoint_and_do_not_assume_transitive_similarity():
+    a, b, c, d = (Track(key, key, "Artist") for key in "abcd")
+    result = ComparisonResult((AudioMatch(a, b, 95), AudioMatch(b, c, 99), AudioMatch(c, d, 90)))
+    groups = comparison_groups(result)
+    assert [tuple(t.id for t in group.tracks) for group in groups] == [("a", "b"), ("c", "d")]
+    assert [group.similarity for group in groups] == [95, 90]
+    assert comparison_groups(replace(result, matches=tuple(reversed(result.matches)))) == groups
+    assert not comparison_groups(replace(result, cancelled=True))
+
+
+def test_track_groups_prefer_bitrate_then_playlists_and_show_minimum_score():
+    a = Track("a", "First", "Artist", bitrate=128, playlists=2)
+    b = Track("b", "Second", "Artist", bitrate=320)
+    c = Track("c", "Third", "Artist", bitrate=320, playlists=1)
+    groups = comparison_groups(ComparisonResult((AudioMatch(a, b, 98), AudioMatch(a, c, 90), AudioMatch(b, c, 96))))
+    assert len(groups) == 1
+    assert groups[0].recommended_id == "c" and groups[0].similarity == 90
+    assert [track.id for track in groups[0].tracks] == ["c", "b", "a"]
 
 
 @pytest.mark.parametrize("score, expected", [(89.9999, False), (90.0, False), (90.0001, True)])
@@ -212,6 +233,7 @@ def test_skips_missing_short_corrupt_and_silent_files_with_reasons(tmp_path):
     assert result.checked == 0 and not result.matches
     assert len(result.skipped) == 4
     assert "kürzer" in result.skipped[0] and "Stille" in result.skipped[1]
+    assert result.errors == result.skipped
 
 
 def test_same_file_for_multiple_track_entries_is_read_once(tmp_path, monkeypatch):
