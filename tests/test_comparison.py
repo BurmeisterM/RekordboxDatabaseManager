@@ -1,6 +1,7 @@
 from dataclasses import replace
 from contextlib import closing
 import os
+from pathlib import Path
 import sqlite3
 from threading import Event
 import wave
@@ -14,7 +15,7 @@ from rekordbox_manager.comparison import (
     compare_tracks, comparison_groups, read_middle, signature, similarity, verify_duplicate_groups,
 )
 from rekordbox_manager.domain import ManagerError, Track, find_duplicates
-from rekordbox_manager.comparison_store import ComparisonStore, remove_cached_tracks
+from rekordbox_manager.comparison_store import ComparisonStore, comparison_database_path, remove_cached_tracks
 
 
 def write_wav(path, samples, rate=SAMPLE_RATE):
@@ -52,6 +53,50 @@ def test_reads_exact_center_window_and_releases_file(tmp_path):
     assert len(result) == SAMPLE_COUNT
     assert np.corrcoef(expected, result)[0, 1] > 0.99999
     path.rename(tmp_path / "released.wav")
+
+
+@pytest.mark.parametrize("rate", [8000, 44100, 48000])
+def test_mp3_center_window_at_common_sample_rates(tmp_path, rate):
+    path = write_mp3(tmp_path / "Modular Phaze - Æxus.mp3",
+                     np.random.default_rng(12).normal(0, 0.1, rate * 12), rate)
+    samples = read_middle(path, Event())
+    assert len(samples) == SAMPLE_COUNT and np.isfinite(samples).all()
+    path.rename(tmp_path / "released.mp3")
+
+
+def test_failed_seek_recovers_exact_middle_without_padding(tmp_path, monkeypatch):
+    from rekordbox_manager import comparison
+    samples = np.random.default_rng(12).normal(0, 0.15, 12 * SAMPLE_RATE)
+    path = write_wav(tmp_path / "bad-index.wav", samples)
+
+    def failed_seek(*args):
+        raise ManagerError("Der mittlere Fünf-Sekunden-Ausschnitt konnte nicht vollständig gelesen werden.")
+
+    monkeypatch.setattr(comparison, "_read_middle_seek", failed_seek)
+    result = read_middle(path, Event())
+    expected = samples[int(3.5 * SAMPLE_RATE):int(8.5 * SAMPLE_RATE)]
+    assert len(result) == SAMPLE_COUNT
+    assert np.corrcoef(expected, result)[0, 1] > 0.99999
+    short = write_wav(tmp_path / "short.wav", samples[:4 * SAMPLE_RATE])
+    with pytest.raises(ManagerError, match="kürzer"):
+        read_middle(short, Event())
+
+
+def test_sequential_recovery_can_be_cancelled_and_releases_files(tmp_path):
+    from rekordbox_manager import comparison
+    path = write_mp3(tmp_path / "fallback.mp3", np.ones(12 * SAMPLE_RATE) * 0.1)
+
+    class CancelDuringDecode(Event):
+        calls = 0
+
+        def is_set(self):
+            self.calls += 1
+            return self.calls >= 10
+
+    # The recovery is used directly to ensure cancellation occurs while decoding.
+    with pytest.raises(ComparisonCancelled):
+        comparison._read_middle_sequential(path, CancelDuringDecode())
+    path.rename(tmp_path / "released.mp3")
 
 
 def test_detects_same_artist_audio_with_different_titles_gain_and_file_edges(tmp_path):
@@ -304,7 +349,7 @@ def indexed_audio(tmp_path):
     first, other = (rng.normal(0, 0.1, 12 * SAMPLE_RATE) for _ in range(2))
     tracks = tuple(Track(key, key, "Artist", path=str(write_mp3(tmp_path / f"{key}.mp3", samples)))
                    for key, samples in (("a", first), ("b", first), ("c", other)))
-    cache = tmp_path / "master.trackvergleich.sqlite3"
+    cache = comparison_database_path(tmp_path / "master.db")
     result = compare_tracks(tracks, Event(), cache_path=cache)
     assert result.updated == 3 and result.checked == 3
     assert [(m.first.id, m.second.id) for m in result.matches] == [("a", "b")]
@@ -388,7 +433,7 @@ def test_artist_changes_reuse_audio_and_title_changes_use_current_metadata(index
 
 def test_cached_deletion_cascades_and_external_removal_is_pruned(indexed_audio):
     tracks, cache, _, _ = indexed_audio
-    remove_cached_tracks(cache.with_name("master.db"), ["a"])
+    remove_cached_tracks(Path(tracks[0].path).parent / "master.db", ["a"])
     with closing(sqlite3.connect(cache)) as connection:
         assert connection.execute("SELECT id FROM tracks ORDER BY id").fetchall() == [("b",), ("c",)]
         assert connection.execute("SELECT * FROM matches").fetchall() == []
@@ -425,6 +470,56 @@ def test_cancelled_persistent_scan_resumes_without_rereading_indexed_files(tmp_p
     assert sum(path == tmp_path / "0.mp3" for path in reads) == 1
     if phase == "pairs":
         assert len(reads) == 3
+
+
+def test_cancellation_commits_small_match_batch_and_keeps_audio_for_resume(tmp_path, monkeypatch):
+    from rekordbox_manager import comparison
+    samples = np.random.default_rng(5).normal(0, 0.1, 12 * SAMPLE_RATE)
+    tracks = tuple(Track(str(i), str(i), "Artist",
+                         path=str(write_mp3(tmp_path / f"{i}.mp3", samples))) for i in range(3))
+    cache, cancel = tmp_path / "cache.sqlite3", Event()
+
+    # Request cancellation after the first pair, before the normal 25-pair commit.
+    score = comparison.similarity
+
+    def stop_after_score(*args):
+        value = score(*args)
+        cancel.set()
+        return value
+
+    monkeypatch.setattr(comparison, "similarity", stop_after_score)
+    result = compare_tracks(tracks, cancel, cache_path=cache)
+    assert result.cancelled and not result.matches
+    with ComparisonStore(cache) as store:
+        assert len(tuple(store.matches())) == 1
+        assert len(store.entries()) == 3
+    monkeypatch.setattr(comparison, "similarity", score)
+    monkeypatch.setattr(comparison, "read_middle", lambda *args: pytest.fail("Saved audio must survive cancellation"))
+    result = compare_tracks(tracks, Event(), cache_path=cache)
+    assert result.reused == 3 and len(result.matches) == 3
+
+
+def test_update_retries_old_incomplete_window_errors_without_discarding_good_audio(indexed_audio, monkeypatch):
+    from rekordbox_manager import comparison
+    from rekordbox_manager.comparison_store import path_key
+    tracks, cache, _, _ = indexed_audio
+    failed = tracks[0]
+    stat = os.stat(failed.path)
+    with ComparisonStore(cache) as store:
+        store.put(failed.id, path_key(failed.path), "artist", (stat.st_size, stat.st_mtime_ns),
+                  error="Der mittlere Fünf-Sekunden-Ausschnitt konnte nicht vollständig gelesen werden.")
+    reads, real_read = [], comparison.read_middle
+
+    def read(path, cancel):
+        reads.append(str(path))
+        return real_read(path, cancel)
+
+    monkeypatch.setattr(comparison, "read_middle", read)
+    assert compare_tracks(tracks, Event(), cache_path=cache).errors
+    assert not reads
+    result = compare_tracks(tracks, Event(), cache_path=cache, update=True)
+    assert not reads and result.reused == 3
+    assert len(result.matches) == 1 and not result.errors
 
 
 def test_duplicate_file_references_use_persisted_audio_even_for_new_ids(indexed_audio, monkeypatch):

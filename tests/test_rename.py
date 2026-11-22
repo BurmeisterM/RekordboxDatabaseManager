@@ -230,6 +230,11 @@ def test_real_schema_and_analysis_on_isolated_copies(tmp_path, monkeypatch, layo
         track_id, analysis_path = str(row["ID"]), row["AnalysisDataPath"]
         conn.execute("UPDATE djmdContent SET FolderPath=?, OrgFolderPath=?, rb_LocalFolderPath=? WHERE ID=?",
                      (audio.as_posix(), audio.as_posix(), audio.as_posix(), track_id))
+        # Every remaining audio path must also stay inside this isolated test.
+        # The sample collection may reference disconnected real-world volumes.
+        missing = (tmp_path / "unavailable-other-audio.mp3").as_posix()
+        conn.execute("UPDATE djmdContent SET FolderPath=?, OrgFolderPath=?, rb_LocalFolderPath=? WHERE ID<>?",
+                     (missing, missing, missing, track_id))
         conn.commit()
     relative = Path(analysis_path.replace("\\", "/").lstrip("/"))
     original_analysis = source.parent / "share" / relative
@@ -413,12 +418,12 @@ def test_concurrent_change_disables_incremental_refresh(collection, monkeypatch,
         original_fingerprint = db.fingerprint
         checks = 0
 
-        def fingerprint(file):
+        def fingerprint(file, *args, **kwargs):
             nonlocal checks
             checks += 1
             if checks == (3 if when == "during_snapshot" else 4):
                 external_edit()
-            return original_fingerprint(file)
+            return original_fingerprint(file, *args, **kwargs)
 
         monkeypatch.setattr(db, "fingerprint", fingerprint)
     result = db.rename_track(library, "copy", "New")

@@ -12,12 +12,12 @@ from PySide6.QtCore import (
     QAbstractTableModel, QEvent, QModelIndex, QObject, QRunnable, QSettings,
     QSize, Qt, QThreadPool, QTimer, QUrl, Signal,
 )
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImage, QImageReader, QPainter, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLayout,
+    QCheckBox, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLayout,
     QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-    QScrollArea, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget,
+    QScrollArea, QSpinBox, QSplitter, QStyle, QStyledItemDelegate, QStyleOptionComboBox, QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget,
 )
 
 from . import __version__
@@ -26,9 +26,10 @@ from .database import (
 )
 from .domain import Library, ManagerError, RemovalPlan, Track, display_date, normalize, validate_plan
 from .playback import AudioPreview
-from .comparison import compare_tracks, comparison_groups
+from .comparison import ComparisonCancelled, ComparisonResult, check_cancelled, compare_tracks, comparison_groups
 from .comparison_ui import ComparisonPage
-from .comparison_store import comparison_database_path, local_comparison_database_path
+from .comparison_store import comparison_database_path, prepare_comparison_database
+from .io_control import ReadOptions, ReadSession, current_session
 
 
 STYLE = """
@@ -116,25 +117,75 @@ def placeholder(size: int = 46) -> QPixmap:
     return pixmap
 
 
-class CoverCache:
+class CoverCache(QObject):
+    changed = Signal()
+
     def __init__(self):
-        self.cache: OrderedDict[str, QPixmap] = OrderedDict()
+        super().__init__()
+        self.cache = OrderedDict()
+        self.queue = OrderedDict()
+        self.active = None
+        self.generation = 0
+        self.suspended = False
         self.empty = placeholder()
 
-    def get(self, path: str) -> QPixmap:
-        if not path:
+    def clear(self):
+        self.generation += 1
+        self.cache.clear()
+        self.queue.clear()
+
+    def get(self, track, size=46) -> QPixmap:
+        paths = track.cover_paths or ((track.cover,) if track.cover else ())
+        if not paths:
             return self.empty
-        if path in self.cache:
-            self.cache.move_to_end(path)
-            return self.cache[path]
-        pixmap = QPixmap(path)
-        pixmap = (pixmap.scaled(46, 46, Qt.AspectRatioMode.KeepAspectRatio,
-                              Qt.TransformationMode.SmoothTransformation)
-                  if not pixmap.isNull() else self.empty)
-        self.cache[path] = pixmap
-        if len(self.cache) > 500:
-            self.cache.popitem(last=False)
-        return pixmap
+        if paths in self.cache:
+            self.cache.move_to_end(paths)
+            return self.cache[paths].scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio,
+                                            Qt.TransformationMode.SmoothTransformation)
+        if not self.suspended:
+            self.queue[paths] = True
+            if len(self.queue) > 64:
+                self.queue.popitem(last=False)
+            self._next()
+        return self.empty
+
+    def _next(self):
+        if self.suspended or self.active is not None or not self.queue:
+            return
+        paths, _ = self.queue.popitem(last=False)
+        generation = self.generation
+
+        def read():
+            for path in paths:
+                reader = QImageReader(path)
+                size = reader.size()
+                if size.isValid():
+                    reader.setScaledSize(size.scaled(QSize(150, 150), Qt.AspectRatioMode.KeepAspectRatio))
+                image = reader.read()
+                if not image.isNull():
+                    return generation, paths, image
+            return generation, paths, QImage()
+
+        task = Task(read)
+        self.active = task
+        task.signals.done.connect(self._loaded)
+        task.signals.failed.connect(self._failed)
+        QThreadPool.globalInstance().start(task)
+
+    def _loaded(self, output):
+        generation, paths, image = output
+        self.active = None
+        if generation == self.generation:
+            self.queue.pop(paths, None)
+            self.cache[paths] = QPixmap.fromImage(image) if not image.isNull() else self.empty
+            if len(self.cache) > 500:
+                self.cache.popitem(last=False)
+            self.changed.emit()
+        self._next()
+
+    def _failed(self, message):
+        self.active = None
+        self._next()
 
 
 class CoverLabel(QLabel):
@@ -292,7 +343,6 @@ class TrackModel(QAbstractTableModel):
         self.groups_by_track = {t.id: g for g in groups for t in g.tracks}
         self.recommended = {g.recommended_id for g in groups}
         self.group_numbers = {t.id: index for index, g in enumerate(groups, 1) for t in g.tracks}
-        self.covers = CoverCache()
         self.refresh()
 
     def refresh(self):
@@ -336,7 +386,7 @@ class TrackModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.CheckStateRole and col == 0 and group:
             return Qt.CheckState.Checked if track.id in self.selected else Qt.CheckState.Unchecked
         if role == Qt.ItemDataRole.DecorationRole and col == 1:
-            return self.covers.get(track.cover)
+            return self.covers.get(track)
         if role == Qt.ItemDataRole.ToolTipRole:
             if col == 2:
                 return f"Doppelklick: Titel bearbeiten · Return: speichern\n{track.title}\n{track.path}"
@@ -474,6 +524,7 @@ class TaskSignals(QObject):
     done = Signal(object)
     failed = Signal(str)
     progress = Signal(int, int, str)
+    cancelled = Signal()
 
 
 class Task(QRunnable):
@@ -486,6 +537,8 @@ class Task(QRunnable):
     def run(self):
         try:
             result = self.function(self.signals.progress.emit) if self.with_progress else self.function()
+        except ComparisonCancelled:
+            self.signals.cancelled.emit()
         except ManagerError as exc:
             self.signals.failed.emit(str(exc))
         except Exception as exc:
@@ -603,6 +656,9 @@ class MainWindow(QMainWindow):
         self.library: Library | None = None
         self.busy = False
         self.active_task = None
+        self.task_cancel = None
+        self.io_session = None
+        self.close_pending = False
         self.comparison_view = False
         self.comparison_cancel = None
         self.comparison_source: Library | None = None
@@ -611,11 +667,13 @@ class MainWindow(QMainWindow):
         self.model = TrackModel()
         self.title_model = self.model
         self.comparison_model = TrackModel()
+        self.comparison_model.covers = self.title_model.covers
         for model in (self.title_model, self.comparison_model):
             model.selection_changed.connect(self.update_summary)
             model.safety_warning.connect(self.show_safety_warning)
         self.preview = AudioPreview(self)
         self._build()
+        self.title_model.covers.changed.connect(self.covers_changed)
         self.preview.changed.connect(self.preview_changed)
         self.preview.failed.connect(lambda message: QMessageBox.warning(self, "Hörprobe nicht möglich", message))
         for model in (self.title_model, self.comparison_model):
@@ -674,6 +732,12 @@ class MainWindow(QMainWindow):
         self.reload_button = button("Neu laden", self.reload_database)
         self.reload_button.setEnabled(False)
         self.open_button = button("Datenbank öffnen…", self.choose_database, "primary")
+        self.cancel_task_button = button("Vorgang abbrechen", self.cancel_task)
+        self.cancel_task_button.hide()
+        self.resume_button = button("Fortsetzen", self.resume_reads)
+        self.resume_button.hide()
+        top.addWidget(self.cancel_task_button)
+        top.addWidget(self.resume_button)
         top.addWidget(self.reload_button)
         top.addWidget(self.open_button)
         content.addLayout(top)
@@ -687,6 +751,28 @@ class MainWindow(QMainWindow):
         self.dupe_stat = self._stat(stats, "DUPLIKATGRUPPEN")
         self.selected_stat = self._stat(stats, "ZUM ENTFERNEN MARKIERT")
         content.addLayout(stats)
+
+        read_controls = QHBoxLayout()
+        self.gentle_checkbox = QCheckBox("Schonmodus")
+        self.gentle_checkbox.setChecked(self.settings.value("gentle_reads", True, type=bool))
+        self.read_rate = QSpinBox()
+        self.read_rate.setRange(1, 500)
+        self.read_rate.setSuffix(" MiB/s")
+        self.read_rate.setValue(self.settings.value("read_rate", 8, type=int))
+        self.read_pause = QSpinBox()
+        self.read_pause.setRange(0, 5000)
+        self.read_pause.setSuffix(" ms Pause je Datei")
+        self.read_pause.setValue(self.settings.value("read_pause", 100, type=int))
+        read_controls.addWidget(self.gentle_checkbox)
+        read_controls.addWidget(self.read_rate)
+        read_controls.addWidget(self.read_pause)
+        read_controls.addStretch()
+        for widget in (self.gentle_checkbox, self.read_rate, self.read_pause):
+            widget.setToolTip("Begrenzt Audio-Lesezugriffe und die Datenbank-Prüfsummenprüfung. Einstellungen werden gespeichert.")
+        self.gentle_checkbox.toggled.connect(self.save_read_options)
+        self.read_rate.valueChanged.connect(self.save_read_options)
+        self.read_pause.valueChanged.connect(self.save_read_options)
+        content.addLayout(read_controls)
 
         tools = QHBoxLayout()
         self.search = QLineEdit()
@@ -893,17 +979,26 @@ class MainWindow(QMainWindow):
         library = self.comparison_source or self.library
         self.comparison_cancel = Event()
         cancel = self.comparison_cancel
+        session = ReadSession(cancel, self.read_options())
+        self.io_session = session
         self.comparison_page.start()
 
         def compare(report):
+            session.progress = report
             # Read only collection metadata when updating: the title comparison
             # must not decode unchanged candidates as a side effect of this scan.
-            source = load_library(library.path, verify_audio=False) if update else library
-            result = compare_tracks(source.tracks, cancel, report,
-                                    cache_path=comparison_database_path(source.path),
-                                    fallback_cache_path=local_comparison_database_path(source.path),
-                                    library_id=source.db_id, update=update)
-            groups = comparison_groups(result)
+            source = library
+            result = ComparisonResult(cancelled=True)
+            try:
+                source = load_library(library.path, verify_audio=False, cancel=cancel, progress=report,
+                                      session=session) if update else library
+                result = compare_tracks(source.tracks, cancel, report,
+                                        cache_path=prepare_comparison_database(source.path, session),
+                                        library_id=source.db_id, update=update, session=session)
+                groups = comparison_groups(result, cancel)
+            except ComparisonCancelled:
+                result = replace(result, matches=(), cancelled=True)
+                groups = ()
             if cancel.is_set():
                 result = replace(result, matches=(), cancelled=True)
                 groups = ()
@@ -926,11 +1021,23 @@ class MainWindow(QMainWindow):
 
         self.run_task(compare, completed,
                       "Trackvergleich läuft · Vergleichsdatenbank wird geprüft …", failure=failed,
-                      progress=self.comparison_page.report_progress)
+                      progress=self.report_read_progress, cancel=cancel)
 
     def cancel_comparison(self):
         if self.comparison_cancel is not None:
             self.comparison_cancel.set()
+            self.cancel_task()
+
+    def cancel_task(self):
+        if self.task_cancel is None:
+            return
+        self.task_cancel.set()
+        self.cancel_task_button.setEnabled(False)
+        if self.comparison_page.running:
+            self.comparison_page.cancel_button.setEnabled(False)
+            self.comparison_page.status.setText("Trackvergleich wird sicher beendet. Gespeicherte Vergleichsdaten bleiben erhalten …")
+        self.status_label.setText("Abbruch angefordert · Offene Lesevorgänge werden beendet …" +
+                                  (" Die App schließt anschließend automatisch." if self.close_pending else ""))
 
     def filter_rows(self, text):
         self.model.search = text
@@ -946,7 +1053,8 @@ class MainWindow(QMainWindow):
                 # Already-open discoveries still leave other databases selectable.
                 self.choose_database_file(path)
 
-        self.run_task(default_database, discovered, "master.db wird über die Rekordbox-Einstellungen gesucht…")
+        self.run_read_task(lambda cancel, report: default_database(), discovered,
+                           "master.db wird über die Rekordbox-Einstellungen gesucht…")
 
     def choose_database_file(self, discovered=None):
         last = self.settings.value("last_database", "")
@@ -966,12 +1074,12 @@ class MainWindow(QMainWindow):
             return
         path = self.startup_path
 
-        def read_remembered():
+        def read_remembered(cancel, report):
             # External drives can be slow or disconnected; check off the UI thread.
             if path and Path(path).is_file():
-                return load_library(path)
+                return load_library(path, cancel=cancel, progress=report)
             found = default_database()
-            return load_library(found) if found else None
+            return load_library(found, cancel=cancel, progress=report) if found else None
 
         def startup_loaded(library):
             if library is not None:
@@ -982,7 +1090,7 @@ class MainWindow(QMainWindow):
                 self.path_label.setToolTip(path)
                 self.status_label.setText("Keine erreichbare master.db gefunden · Bitte über „Datenbank öffnen“ auswählen.")
 
-        self.run_task(read_remembered, startup_loaded, "Gespeicherter Pfad und Rekordbox-Einstellungen werden geprüft…")
+        self.run_read_task(read_remembered, startup_loaded, "Gespeicherter Pfad und Rekordbox-Einstellungen werden geprüft…")
 
     def open_database(self, path, *, discovered=False):
         if self.title_model.selected or self.comparison_model.selected:
@@ -995,14 +1103,16 @@ class MainWindow(QMainWindow):
             self.task_finished()
             self.choose_database_file()
 
-        self.run_task(lambda: load_library(path), self.loaded, "Sammlung wird gelesen und geprüft…",
-                      failure=discovery_failed if discovered else None)
+        self.run_read_task(lambda cancel, report: load_library(path, cancel=cancel, progress=report),
+                           self.loaded, "Sammlung wird gelesen und geprüft…",
+                           failure=discovery_failed if discovered else None)
 
     def reload_database(self):
         if self.library:
             self.open_database(str(self.library.path))
 
     def loaded(self, library):
+        self.title_model.covers.clear()
         self.startup_timer.stop()
         self.preview.stop()
         self.library = library
@@ -1023,14 +1133,90 @@ class MainWindow(QMainWindow):
             + (f" {excluded} Titel ohne Titel/Interpret werden bei der Duplikatsuche ausgelassen." if excluded else ""))
         self.update_summary()
 
-    def run_task(self, function, callback, status, *, failure=None, progress=None):
+    def report_task_progress(self, current, total, message):
+        if self.task_cancel is not None and not self.task_cancel.is_set():
+            self.progress.setRange(0, total if total > 0 else 0)
+            self.progress.setValue(current)
+            self.status_label.setText(message)
+
+    def report_read_progress(self, current, total, message):
+        self.report_task_progress(current, total, message)
+        if self.comparison_page.running:
+            self.comparison_page.report_progress(current, total, message)
+        self.resume_button.setVisible(bool(self.io_session and self.io_session.paused.is_set()))
+
+    def resume_reads(self):
+        if self.io_session is not None:
+            self.resume_button.hide()
+            self.io_session.resume()
+            self.title_model.covers.clear()
+
+    def read_options(self):
+        return ReadOptions(self.gentle_checkbox.isChecked(), self.read_rate.value(), self.read_pause.value())
+
+    def save_read_options(self, *args):
+        options = self.read_options()
+        self.settings.setValue("gentle_reads", options.gentle)
+        self.settings.setValue("read_rate", options.mib_per_second)
+        self.settings.setValue("read_pause", options.pause_ms)
+        self.settings.sync()
+
+    def covers_changed(self):
+        self.table.viewport().update()
+        if not self.busy:
+            self.show_track(self.table.currentIndex())
+
+    def run_read_task(self, function, callback, status, *, failure=None):
+        if self.busy:
+            return
+        cancel = Event()
+        session = ReadSession(cancel, self.read_options())
+        self.io_session = session
+
+        def read(report):
+            session.progress = report
+            check_cancelled(cancel)
+            # Metadata loaders use this same session for deduplication, pacing
+            # and volume recovery. Discovery itself does not read music files.
+            token = current_session.set(session)
+            try:
+                result = function(cancel, report)
+            finally:
+                current_session.reset(token)
+            check_cancelled(cancel)
+            return result
+
+        def completed(result):
+            # The request may arrive after the worker returned but before its
+            # queued completion is delivered. Keep the previous model then too.
+            if cancel.is_set():
+                self.status_label.setText("Vorgang abgebrochen · Sammlung und Musikdateien wurden nicht geändert.")
+            else:
+                callback(result)
+
+        def failed(message):
+            if cancel.is_set():
+                self.task_cancelled()
+            else:
+                (failure or self.task_failed)(message)
+
+        self.run_task(read, completed, status, failure=failed,
+                      progress=self.report_read_progress, cancel=cancel)
+
+    def task_cancelled(self):
+        self.task_finished()
+        self.status_label.setText("Vorgang abgebrochen · Sammlung und Musikdateien wurden nicht geändert.")
+
+    def run_task(self, function, callback, status, *, failure=None, progress=None, cancel=None):
         if self.busy:
             return
         self.startup_timer.stop()
         self.preview.stop()
         self.busy = True
+        self.task_cancel = cancel
         self.set_controls()
         self.progress.show()
+        self.progress.setRange(0, 0)
         self.status_label.setText(status)
         task = Task(function, with_progress=progress is not None)
         if progress is not None:
@@ -1043,13 +1229,19 @@ class MainWindow(QMainWindow):
 
         task.signals.done.connect(done)
         task.signals.failed.connect(failure or self.task_failed)
+        task.signals.cancelled.connect(self.task_cancelled)
         QThreadPool.globalInstance().start(task)
 
     def task_finished(self):
         self.busy = False
         self.progress.hide()
         self.active_task = None
+        self.task_cancel = None
+        self.io_session = None
+        self.resume_button.hide()
         self.set_controls()
+        if self.close_pending:
+            QTimer.singleShot(0, self.close)
 
     def task_failed(self, message):
         self.task_finished()
@@ -1057,6 +1249,13 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Vorgang nicht abgeschlossen", message)
 
     def set_controls(self):
+        self.title_model.covers.suspended = self.busy
+        if not self.busy:
+            self.title_model.covers._next()
+        for widget in (self.gentle_checkbox, self.read_rate, self.read_pause):
+            widget.setEnabled(not self.busy)
+        self.cancel_task_button.setVisible(self.busy and self.task_cancel is not None)
+        self.cancel_task_button.setEnabled(self.task_cancel is not None and not self.task_cancel.is_set())
         for widget in (self.open_button, self.search, self.table, self.all_button, self.dupes_button, self.compare_button):
             widget.setEnabled(not self.busy)
         self.comparison_page.set_available(bool(self.library), self.busy)
@@ -1112,7 +1311,7 @@ class MainWindow(QMainWindow):
         track = self.current_track()
         if not track:
             return
-        pixmap = QPixmap(track.cover) if track.cover else placeholder(150)
+        pixmap = self.model.covers.get(track, 150)
         if pixmap.isNull():
             pixmap = placeholder(150)
         self.detail_cover.setPixmap(pixmap.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio,
@@ -1200,8 +1399,8 @@ class MainWindow(QMainWindow):
         if result.library is not None:
             refreshed(result.library)
         else:
-            self.run_task(lambda: load_library(old_path), refreshed, "Aktualisierte Sammlung wird geladen…",
-                          failure=refresh_failed)
+            self.run_read_task(lambda cancel, report: load_library(old_path, cancel=cancel, progress=report),
+                               refreshed, "Aktualisierte Sammlung wird geladen…", failure=refresh_failed)
 
     def preview_current(self):
         track = self.current_track()
@@ -1247,7 +1446,8 @@ class MainWindow(QMainWindow):
         self.reset_details()
         box = removal_message(result, self)
         box.exec()
-        self.run_task(lambda: load_library(old_path), self.loaded, "Aktualisierte Sammlung wird geladen…")
+        self.run_read_task(lambda cancel, report: load_library(old_path, cancel=cancel, progress=report),
+                           self.loaded, "Aktualisierte Sammlung wird geladen…")
 
     def open_backups(self):
         root = self.last_backup or (self.library.path.parent / "RekordboxManager-Backups" if self.library else None)
@@ -1281,7 +1481,9 @@ class MainWindow(QMainWindow):
             "Nicht lesbare, zu kurze oder stille Kandidaten werden mit Grund ausgelassen.\n\n"
             "Trackvergleich: Nur MP3-Dateien desselben Interpreten werden verglichen. Je Datei werden fünf Sekunden um die tatsächliche Mitte "
             "verglichen. Treffer ab 90 % erscheinen in Gruppen mit denselben Funktionen wie beim Titelvergleich. "
-            "Beim ersten Start wird eine Vergleichsdatenbank neben der master.db aufgebaut. Ohne Schreibzugriff wird sie lokal im Benutzerprofil gespeichert. Weitere Starts verwenden die gespeicherten Daten. "
+            "Die Vergleichsdatenbank liegt immer lokal im Benutzerprofil. Vorhandene Daten neben der master.db werden einmalig unverändert übernommen. "
+            "Titel- und Trackvergleich teilen gespeicherte Audioausschnitte. Der Schonmodus begrenzt die Audio-Leserate und ergänzt Pausen je Datei. "
+            "Bei Laufwerkstrennung pausiert die Prüfung; nach Wiederverbindung „Fortsetzen“ anklicken. "
             "„Aktualisieren“ gleicht den aktuellen Sammlungsbestand ab und liest nur neue oder geänderte Dateien ein. "
             "Gelöschte Tracks werden auch aus der Vergleichsdatenbank entfernt. "
             "Alle Mitglieder einer Gruppe stimmen untereinander überein. "
@@ -1293,6 +1495,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         if self.busy:
+            if self.task_cancel is not None:
+                self.close_pending = True
+                self.cancel_task()
+                event.ignore()
+                return
             QMessageBox.information(self, "Vorgang läuft", "Bitte den laufenden Vorgang abwarten, bevor die App geschlossen wird.")
             event.ignore()
             return

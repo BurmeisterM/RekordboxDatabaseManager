@@ -14,11 +14,17 @@ def main():
     if args.report and not args.diagnose:
         parser.error("--report benötigt --diagnose")
     if args.diagnose:
-        from rekordbox_manager.database import load_library
+        from rekordbox_manager.database import _file_available, load_library
         try:
             library = load_library(args.diagnose)
+            covers = {}
+            for track in library.tracks:
+                paths = track.cover_paths or ((track.cover,) if track.cover else ())
+                if paths not in covers:
+                    covers[paths] = any(_file_available(Path(path)) for path in paths)
             report = {"ok": True, "tracks": len(library.tracks), "duplicate_groups": len(library.groups),
-                      "encrypted": library.encrypted, "covers_found": sum(bool(t.cover) for t in library.tracks)}
+                      "encrypted": library.encrypted, "covers_found": sum(covers[t.cover_paths or ((t.cover,) if t.cover else ())]
+                                                                          for t in library.tracks)}
         except Exception as exc:
             report = {"ok": False, "error": str(exc)}
         text = json.dumps(report, ensure_ascii=False, indent=2)

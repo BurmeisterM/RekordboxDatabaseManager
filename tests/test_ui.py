@@ -1,4 +1,5 @@
 import time
+import errno
 from contextlib import closing
 import sqlite3
 from dataclasses import replace
@@ -18,8 +19,9 @@ from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QFileDialog, QLineE
 from rekordbox_manager.database import load_library
 from rekordbox_manager.domain import DuplicateGroup, ManagerError, RemovalPlan, validate_plan
 from rekordbox_manager.ui import MainWindow, RemovalDialog, Task, TrackModel, app_settings
-from rekordbox_manager.comparison import AudioMatch, ComparisonResult, compare_tracks
+from rekordbox_manager.comparison import AudioMatch, ComparisonResult, check_cancelled, compare_tracks
 from rekordbox_manager.comparison_store import comparison_database_path, local_comparison_database_path
+from rekordbox_manager.io_control import ReadOptions
 
 
 @pytest.fixture(autouse=True)
@@ -197,10 +199,8 @@ def test_track_comparison_removal_uses_audio_groups_and_preserves_playlist_posit
     window.close()
 
 
-def test_track_comparison_uses_local_fallback_and_shows_actual_path(qt_app, collection):
+def test_track_comparison_uses_local_cache_and_shows_actual_path(qt_app, collection):
     library = load_library(collection[0])
-    # A directory in place of the SQLite file produces the same CANTOPEN error.
-    comparison_database_path(library.path).mkdir()
     window = MainWindow()
     window.loaded(library)
     window.compare_button.click()
@@ -236,6 +236,117 @@ def test_track_comparison_can_be_cancelled_and_restarted(qt_app, collection, mon
     window.close()
 
 
+@pytest.mark.parametrize("action", ["button", "close"])
+def test_loading_can_be_cancelled_without_losing_existing_collection(qt_app, collection, monkeypatch, action):
+    from rekordbox_manager import database
+    library = load_library(collection[0])
+    before = database.fingerprint(library.path)
+    window = MainWindow()
+    window.loaded(library)
+    window.model.apply_recommendations()
+    selected = set(window.model.selected)
+    started = Event()
+
+    def verify(groups, cancel, progress, **kwargs):
+        progress(0, 2, "Audio lesen …")
+        started.set()
+        assert cancel.wait(5)
+        check_cancelled(cancel)
+
+    monkeypatch.setattr(database, "verify_duplicate_groups", verify)
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: pytest.fail("Read-only loading should cancel on close"))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: pytest.fail("Cancellation is not a failure"))
+    window.show()
+    window.reload_database()
+    assert started.wait(5)
+    assert window.cancel_task_button.isVisible() and window.cancel_task_button.isEnabled()
+    if action == "close":
+        window.close()
+    else:
+        window.cancel_task_button.click()
+    wait_for_window(window)
+    QTest.qWait(20)
+    assert window.library is library and window.model.selected == selected
+    assert database.fingerprint(library.path) == before
+    assert window.task_cancel is None and window.cancel_task_button.isHidden()
+    if action == "close":
+        assert not window.isVisible()
+    else:
+        assert window.isVisible() and "abgebrochen" in window.status_label.text()
+        window.close()
+
+
+def test_close_during_track_comparison_waits_for_safe_completion(qt_app, collection, monkeypatch):
+    started, released = Event(), Event()
+
+    def compare(tracks, cancel, progress, **kwargs):
+        started.set()
+        assert cancel.wait(5)
+        assert released.wait(5)
+        return ComparisonResult(cancelled=True, cache_path="cache.sqlite3", updated=2)
+
+    monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", compare)
+    window = MainWindow()
+    window.loaded(load_library(collection[0]))
+    window.show()
+    window.set_comparison_view()
+    window.start_comparison()
+    assert started.wait(5)
+    window.close()
+    assert window.busy and window.isVisible() and window.close_pending
+    assert window.comparison_cancel.is_set()
+    released.set()
+    wait_for_window(window)
+    QTest.qWait(20)
+    assert not window.isVisible()
+    assert "bleiben erhalten" in window.comparison_page.status.text()
+    assert window.comparison_page.result.updated == 2
+
+
+def test_write_tasks_still_finish_before_closing(qt_app, monkeypatch):
+    window = MainWindow()
+    wait_for_window(window)
+    started, release = Event(), Event()
+    messages = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: messages.append(args))
+
+    def write():
+        started.set()
+        assert release.wait(5)
+
+    window.show()
+    window.run_task(write, lambda output: None, "Änderungen speichern …")
+    assert started.wait(5)
+    window.close()
+    assert messages and window.busy and window.isVisible()
+    assert window.task_cancel is None and window.cancel_task_button.isHidden()
+    release.set()
+    wait_for_window(window)
+    window.close()
+
+
+def test_cancelled_discovery_error_does_not_open_another_dialog(qt_app, monkeypatch):
+    started, release = Event(), Event()
+
+    def discover():
+        started.set()
+        assert release.wait(5)
+        raise ManagerError("Laufwerk nicht erreichbar")
+
+    monkeypatch.setattr("rekordbox_manager.ui.default_database", discover)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: pytest.fail("Cancellation must suppress pending read errors"))
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: pytest.fail("No new dialog after cancellation"))
+    window = MainWindow()
+    window.choose_database()
+    assert started.wait(5)
+    window.cancel_task_button.click()
+    release.set()
+    wait_for_window(window)
+    assert window.library is None and "abgebrochen" in window.status_label.text()
+    window.close()
+
+
 def test_track_comparison_failure_restores_controls(qt_app, collection, monkeypatch):
     def fail(*args, **kwargs):
         raise ManagerError("Testfehler")
@@ -264,6 +375,93 @@ def test_track_comparison_disabled_without_library(qt_app):
     window.close()
 
 
+def test_read_settings_are_saved_and_used_by_background_scans(qt_app, collection, monkeypatch):
+    window = MainWindow()
+    wait_for_window(window)
+    window.gentle_checkbox.setChecked(False)
+    window.read_rate.setValue(4)
+    window.read_pause.setValue(250)
+    window.close()
+    window = MainWindow()
+    window.loaded(load_library(collection[0]))
+    assert window.read_options() == ReadOptions(False, 4, 250)
+    received = []
+
+    def compare(tracks, cancel, progress, **kwargs):
+        received.append(kwargs["session"].options)
+        return ComparisonResult()
+
+    monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", compare)
+    window.start_comparison()
+    assert not window.gentle_checkbox.isEnabled() and not window.read_rate.isEnabled()
+    wait_for_window(window)
+    assert received == [ReadOptions(False, 4, 250)]
+    window.close()
+
+
+def test_disconnected_drive_exposes_resume_and_can_continue(qt_app, collection, monkeypatch):
+    from pathlib import Path
+    window = MainWindow()
+    window.loaded(load_library(collection[0]))
+    window.show()
+    first = Path(window.library.tracks[0].path)
+    real_stat, disconnected, attempts = Path.stat, True, []
+
+    def stat(file, *args, **kwargs):
+        if file == first:
+            attempts.append(file)
+            if disconnected:
+                raise OSError(errno.ENODEV, "Laufwerk getrennt")
+        return real_stat(file, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: pytest.fail("A disconnected drive should pause"))
+    window.set_comparison_view()
+    window.start_comparison()
+    deadline = time.monotonic() + 5
+    while not window.resume_button.isVisible() and time.monotonic() < deadline:
+        QTest.qWait(10)
+        time.sleep(0.001)
+    assert window.busy and window.io_session.paused.is_set() and window.resume_button.isVisible()
+    before = len(attempts)
+    QTest.qWait(100)
+    assert len(attempts) == before  # No repeated drive probes while paused.
+    disconnected = False
+    window.resume_button.click()
+    wait_for_window(window)
+    assert not window.resume_button.isVisible()
+    assert window.comparison_page.result.checked == 3 and not window.comparison_page.result.errors
+    window.close()
+
+
+def test_covers_are_lazy_and_shared_between_rows_and_views(qt_app, collection, monkeypatch):
+    from rekordbox_manager import ui
+    window = MainWindow()
+    reader, reads = ui.QImageReader, []
+
+    def image_reader(path):
+        reads.append(path)
+        return reader(path)
+
+    monkeypatch.setattr(ui, "QImageReader", image_reader)
+    library = load_library(collection[0])
+    window.loaded(library)
+    assert not reads
+    cache = window.title_model.covers
+    for track in library.tracks:
+        cache.get(track)
+    deadline = time.monotonic() + 5
+    while (cache.active is not None or cache.queue) and time.monotonic() < deadline:
+        QTest.qWait(10)
+        time.sleep(0.001)
+    assert len(reads) == 1 and cache.active is None
+    assert window.comparison_model.covers is cache
+    for track in library.tracks:
+        assert not cache.get(track, 150).isNull()
+    assert len(reads) == 1
+    window.close()
+
+
 def test_track_comparison_update_reads_fresh_collection_and_only_new_audio(qt_app, collection, tmp_path, monkeypatch):
     from rekordbox_manager import comparison
     path, conn = collection
@@ -274,7 +472,7 @@ def test_track_comparison_update_reads_fresh_collection_and_only_new_audio(qt_ap
     page.start_button.click()
     assert not page.update_button.isEnabled()
     wait_for_window(window)
-    assert page.result.updated == 3 and page.update_button.isEnabled()
+    assert page.result.updated == 1 and page.result.reused == 2 and page.update_button.isEnabled()
     extra = tmp_path / "new.mp3"
     extra.write_bytes((tmp_path / "copy.mp3").read_bytes())
     conn.execute("""INSERT INTO djmdContent (ID, Title, ArtistID, FolderPath, BitRate)
@@ -623,7 +821,7 @@ def test_reload_failure_after_title_save_reports_committed_change(qt_app, collec
     warnings = []
     monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
 
-    def failed_reload(path):
+    def failed_reload(path, **kwargs):
         raise ManagerError("simulated reload failure")
 
     def no_incremental_snapshot(*args):

@@ -5,8 +5,11 @@ from hashlib import sha256
 import os
 from pathlib import Path
 import sqlite3
+from uuid import uuid4
 
 import numpy as np
+
+from .domain import ManagerError
 
 
 # Bump when decoding, sample representation or the similarity algorithm changes.
@@ -14,12 +17,48 @@ ALGORITHM_VERSION = "middle-5s-mono-8000-f32-correlation-250ms-v1"
 
 
 def comparison_database_path(library_path: Path) -> Path:
-    local = local_comparison_database_path(library_path)
-    # Once a fallback has been built, keep using it after a restart even if
-    # the original drive becomes writable again.
-    if local.is_file():
-        return local
-    return Path(library_path).with_suffix(".trackvergleich.sqlite3")
+    return local_comparison_database_path(library_path)
+
+
+def prepare_comparison_database(library_path: Path, session=None) -> Path:
+    """Move work to the user profile; copy a legacy cache without changing it."""
+    target = comparison_database_path(library_path)
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ManagerError(f"Die lokale Vergleichsdatenbank kann nicht angelegt werden:\n{target}\n"
+                           f"Bitte Schreibrechte und freien Speicher prüfen.\n{exc}") from exc
+    if target.exists():
+        return target
+    legacy = Path(library_path).with_suffix(".trackvergleich.sqlite3")
+    temporary = target.with_name(f"migration-{uuid4().hex}.sqlite3")
+
+    def migrate():
+        if not legacy.is_file():
+            return
+        if session is not None:
+            session.progress(0, 0, "Vorhandene Vergleichsdaten lokal übernehmen …")
+        try:
+            with closing(sqlite3.connect(legacy.resolve().as_uri() + "?mode=ro", uri=True)) as source:
+                with closing(sqlite3.connect(temporary)) as destination:
+                    def progress(status, remaining, total):
+                        if session is not None:
+                            session.pace(64 * 4096)
+                    source.backup(destination, pages=64, progress=progress)
+            if not target.exists():
+                os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    try:
+        if session is None:
+            migrate()
+        else:
+            session.call(legacy, migrate)
+    except sqlite3.Error as exc:
+        raise ManagerError(f"Die vorhandene Vergleichsdatenbank konnte nicht übernommen werden:\n{legacy}\n"
+                           f"Die Originaldatei bleibt erhalten.\n{exc}") from exc
+    return target
 
 
 def local_comparison_database_path(library_path: Path) -> Path:
@@ -31,11 +70,12 @@ def local_comparison_database_path(library_path: Path) -> Path:
 def open_comparison_store(path: Path, library_id: str = "", fallback_path: Path | None = None):
     """Fall back only for access errors during opening, never for corrupt data."""
     try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
         return ComparisonStore(path, library_id)
-    except sqlite3.OperationalError as exc:
+    except (sqlite3.OperationalError, OSError) as exc:
         code = getattr(exc, "sqlite_errorcode", 0) & 0xff
-        if fallback_path is None or Path(path) == Path(fallback_path) or code not in (
-                sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PERM):
+        if fallback_path is None or Path(path) == Path(fallback_path) or (not isinstance(exc, OSError) and code not in (
+                sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PERM)):
             raise
         try:
             fallback_path = Path(fallback_path)
@@ -75,6 +115,10 @@ class ComparisonStore:
                 );
                 CREATE INDEX IF NOT EXISTS matches_second ON matches(second_id);
                 CREATE INDEX IF NOT EXISTS tracks_file ON tracks(path, size, mtime_ns);
+                CREATE TABLE IF NOT EXISTS audio_files (
+                    path TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+                    samples BLOB NOT NULL, PRIMARY KEY(path, size, mtime_ns)
+                );
             """)
             metadata = dict(self.connection.execute("SELECT key, value FROM metadata").fetchall())
             # An existing schema can be read from a read-only file. Verify that
@@ -85,8 +129,17 @@ class ComparisonStore:
             if any(metadata.get(key) != value for key, value in identity.items()):
                 with self.connection:
                     self.connection.execute("DELETE FROM tracks")
+                    self.connection.execute("DELETE FROM audio_files")
                     self.connection.execute("DELETE FROM metadata")
                     self.connection.executemany("INSERT INTO metadata VALUES (?, ?)", identity.items())
+            if self.connection.execute("SELECT 1 FROM metadata WHERE key='shared_audio'").fetchone() is None:
+                with self.connection:
+                    self.connection.execute("INSERT OR IGNORE INTO audio_files "
+                        "SELECT path,size,mtime_ns,samples FROM tracks WHERE samples IS NOT NULL "
+                        "AND size IS NOT NULL AND mtime_ns IS NOT NULL")
+                    self.connection.execute("UPDATE tracks SET samples=NULL WHERE samples IS NOT NULL "
+                                            "AND size IS NOT NULL AND mtime_ns IS NOT NULL")
+                    self.connection.execute("INSERT INTO metadata VALUES ('shared_audio','1')")
         except Exception:
             self.connection.close()
             raise
@@ -100,7 +153,9 @@ class ComparisonStore:
     def entries(self):
         # Do not pull every audio blob into RAM just to inspect metadata.
         return {row["id"]: row for row in self.connection.execute(
-            "SELECT id, path, artist, size, mtime_ns, error, pending, samples IS NOT NULL AS ready FROM tracks")}
+            "SELECT id, path, artist, size, mtime_ns, error, pending, "
+            "(samples IS NOT NULL OR EXISTS (SELECT 1 FROM audio_files a WHERE a.path=tracks.path "
+            "AND a.size=tracks.size AND a.mtime_ns=tracks.mtime_ns)) AS ready FROM tracks")}
 
     @property
     def initialized(self):
@@ -122,17 +177,38 @@ class ComparisonStore:
         size, mtime = stamp if stamp is not None else (None, None)
         blob = samples.astype("<f4").tobytes() if samples is not None else None
         with self.connection:
+            if samples is not None:
+                self._save_audio(path, stamp, blob)
             self.connection.execute("DELETE FROM matches WHERE first_id=? OR second_id=?", (track_id, track_id))
             self.connection.execute("""
                 INSERT INTO tracks VALUES (?, ?, ?, ?, ?, ?, ?, 1)
                 ON CONFLICT(id) DO UPDATE SET path=excluded.path, artist=excluded.artist,
                     size=excluded.size, mtime_ns=excluded.mtime_ns, samples=excluded.samples,
                     error=excluded.error, pending=1
-            """, (track_id, path, artist, size, mtime, blob, error))
+            """, (track_id, path, artist, size, mtime, None, error))
+
+    def _save_audio(self, path, stamp, blob):
+        self.connection.execute("DELETE FROM audio_files WHERE path=? AND (size<>? OR mtime_ns<>?)", (path, *stamp))
+        self.connection.execute("INSERT OR IGNORE INTO audio_files VALUES (?, ?, ?, ?)", (path, *stamp, blob))
+
+    def save_audio(self, path, stamp, samples):
+        with self.connection:
+            self._save_audio(path, stamp, samples.astype("<f4").tobytes())
+
+    def cached_samples(self, path, stamp):
+        row = self.connection.execute("SELECT samples FROM audio_files WHERE path=? AND size=? AND mtime_ns=?",
+                                      (path, *stamp)).fetchone()
+        if row is None:
+            # Reuse pre-1.1.6 rows without decoding or rebuilding their matches.
+            row = self.connection.execute("SELECT samples FROM tracks WHERE path=? AND size=? AND mtime_ns=? "
+                                          "AND samples IS NOT NULL LIMIT 1", (path, *stamp)).fetchone()
+        return np.frombuffer(row[0], dtype="<f4") if row is not None else None
 
     def samples(self, track_id):
-        row = self.connection.execute("SELECT samples FROM tracks WHERE id=?", (track_id,)).fetchone()
-        return np.frombuffer(row[0], dtype="<f4")
+        row = self.connection.execute("SELECT samples,path,size,mtime_ns FROM tracks WHERE id=?", (track_id,)).fetchone()
+        if row[0] is not None:
+            return np.frombuffer(row[0], dtype="<f4")
+        return self.cached_samples(row[1], (row[2], row[3]))
 
     def find_file(self, path, stamp):
         return self.connection.execute(
@@ -162,10 +238,8 @@ def remove_cached_tracks(library_path: Path, ids):
     """After a successful Rekordbox commit, remove cache rows and dependent pairs."""
     ids = tuple(ids)
     errors = []
-    # Both may exist after falling back. Clean both so an old adjacent cache
-    # cannot resurrect deleted entries if the local cache is later removed.
-    for path in (local_comparison_database_path(library_path),
-                 Path(library_path).with_suffix(".trackvergleich.sqlite3")):
+    # Legacy caches are read only. A later scan prunes removed IDs after import.
+    for path in (local_comparison_database_path(library_path),):
         try:
             if not path.is_file():
                 continue
@@ -173,6 +247,8 @@ def remove_cached_tracks(library_path: Path, ids):
                 connection.execute("PRAGMA foreign_keys=ON")
                 with connection:
                     connection.executemany("DELETE FROM tracks WHERE id=?", ((key,) for key in ids))
+                    # The shared audio is keyed by file rather than ID and can
+                    # still belong to retained entries using the same file.
         except (sqlite3.Error, OSError) as exc:
             errors.append(f"{path}: {exc}")
     if errors:

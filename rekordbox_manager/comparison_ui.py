@@ -62,8 +62,8 @@ class ComparisonPage(QWidget):
         self.library_path = ""
         self.finished_at = ""
         self.model.set_library(None)
-        self.status.setText("MP3-Vergleich innerhalb desselben Interpreten. Beim ersten Start wird die Vergleichsdatenbank aufgebaut; "
-                            "danach werden gespeicherte Daten verwendet. „Aktualisieren“ erfasst neue und geänderte Tracks.")
+        self.status.setText("MP3-Vergleich innerhalb desselben Interpreten. Titel- und Trackvergleich teilen lokal gespeicherte "
+                            "Audioausschnitte. „Aktualisieren“ erfasst neue und geänderte Tracks.")
         self.status.setToolTip("")
         self.notices.clear()
         self.notices.hide()
@@ -79,7 +79,7 @@ class ComparisonPage(QWidget):
 
     def request_cancel(self):
         self.cancel_button.setEnabled(False)
-        self.status.setText("Trackvergleich wird abgebrochen …")
+        self.status.setText("Trackvergleich wird sicher beendet. Gespeicherte Vergleichsdaten bleiben erhalten …")
         self.cancel_requested.emit()
 
     def report_progress(self, current, total, message):
@@ -101,6 +101,9 @@ class ComparisonPage(QWidget):
                             f"{len(library.groups)} Gruppen · {count} Tracks · {len(result.matches)} Trefferpaare mit mindestens 90 % · "
                             f"{result.checked} Titel geprüft · {len(result.skipped)} übersprungen · {len(result.errors)} Dateifehler")
         if result.cache_path:
+            if result.cancelled:
+                self.status.setText("Trackvergleich abgebrochen. Gespeicherte Vergleichsdaten bleiben erhalten; "
+                                    "„Trackvergleich starten“ setzt die Prüfung fort. Unvollständige Treffer werden nicht angezeigt.")
             self.status.setText(self.status.text() + f" · {result.reused} aus Vergleichsdatenbank · {result.updated} Dateien neu eingelesen")
             self.status.setToolTip(f"Vergleichsdatenbank: {result.cache_path}")
         self.notices.setPlainText("Übersprungene Dateien:\n\n" + "\n\n".join(result.skipped))

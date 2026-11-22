@@ -1,10 +1,12 @@
 """Read-only comparison of five-second audio windows centered on the file midpoint."""
 
 from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from functools import lru_cache
 from itertools import chain, combinations, product
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Event
 import sqlite3
 
@@ -13,6 +15,7 @@ import numpy as np
 
 from .domain import DuplicateGroup, ManagerError, Track, normalize, recommendation_rank
 from .comparison_store import ComparisonStore, open_comparison_store, path_key
+from .io_control import ComparisonCancelled, PacedFile, ReadSession, check_cancelled
 
 
 SAMPLE_RATE = 8000
@@ -23,13 +26,28 @@ MIN_SIMILARITY = 90.0
 FFT_SIZE = 1 << (2 * SAMPLE_COUNT - 1).bit_length()
 
 
-class ComparisonCancelled(Exception):
-    pass
+_read_session = ContextVar("audio_read_session", default=None)
 
 
-def check_cancelled(cancel: Event):
-    if cancel.is_set():
-        raise ComparisonCancelled()
+@contextmanager
+def audio_container(path):
+    session = _read_session.get()
+    if session is not None and session.options.gentle:
+        with PacedFile(path, session) as source, av.open(source) as container:
+            yield container
+    else:
+        with av.open(str(path)) as container:
+            yield container
+
+
+def read_samples(path, cancel, session):
+    token = _read_session.set(session)
+    try:
+        samples = session.call(path, lambda: read_middle(path, cancel))
+        session.file_finished()
+        return samples
+    finally:
+        _read_session.reset(token)
 
 
 @dataclass(frozen=True)
@@ -51,7 +69,7 @@ class ComparisonResult:
     cache_path: str = ""
 
 
-def comparison_groups(result: ComparisonResult) -> tuple[DuplicateGroup, ...]:
+def comparison_groups(result: ComparisonResult, cancel: Event | None = None) -> tuple[DuplicateGroup, ...]:
     """Build disjoint groups whose members all match, with deterministic keepers."""
     if result.cancelled:
         return ()
@@ -59,6 +77,8 @@ def comparison_groups(result: ComparisonResult) -> tuple[DuplicateGroup, ...]:
     tracks = {t.id: t for m in result.matches for t in (m.first, m.second)}
     partitions = []
     for track in sorted(tracks.values(), key=recommendation_rank):
+        if cancel is not None:
+            check_cancelled(cancel)
         for partition in partitions:
             if all(scores.get(frozenset((track.id, other.id)), 0) >= MIN_SIMILARITY
                    for other in partition):
@@ -75,49 +95,22 @@ def comparison_groups(result: ComparisonResult) -> tuple[DuplicateGroup, ...]:
 
 
 def read_middle(path: Path, cancel: Event) -> np.ndarray:
-    """Decode only the center window (plus codec preroll), using the file's duration."""
+    """Try seeking first; recover unreliable MP3 seeks by counting decoded samples."""
     check_cancelled(cancel)
     try:
-        with av.open(str(path)) as container:
-            if not container.streams.audio:
-                raise ManagerError("Die Datei enthält keine Audiospur.")
-            stream = container.streams.audio[0]
-            duration = (float(stream.duration * stream.time_base) if stream.duration is not None
-                        else float(container.duration / av.time_base) if container.duration is not None else 0)
-            if not np.isfinite(duration) or duration <= 0:
-                raise ManagerError("Die tatsächliche Dateidauer konnte nicht ermittelt werden.")
-            if duration < WINDOW_SECONDS:
-                raise ManagerError("Die Datei ist kürzer als fünf Sekunden.")
-            origin = float((stream.start_time or 0) * stream.time_base)
-            start = (duration - WINDOW_SECONDS) / 2 + origin
-            end = start + WINDOW_SECONDS
-            # Compressed formats need a little preroll for their decoder/resampler.
-            container.seek(int(max(origin, start - 0.5) / float(stream.time_base)), stream=stream)
-            resampler = av.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
-            samples = np.zeros(SAMPLE_COUNT, dtype=np.float32)
-            covered = np.zeros(SAMPLE_COUNT, dtype=bool)
-
-            def consume(frame):
-                if frame.time is None:
-                    raise ManagerError("Die Audiospur enthält keine verlässlichen Zeitangaben.")
-                offset = round((frame.time - start) * SAMPLE_RATE)
-                left, right = max(0, offset), min(SAMPLE_COUNT, offset + frame.samples)
-                if right > left:
-                    samples[left:right] = frame.to_ndarray().reshape(-1)[left - offset:right - offset]
-                    covered[left:right] = True
-
-            for frame in container.decode(stream):
-                check_cancelled(cancel)
-                for output in resampler.resample(frame):
-                    consume(output)
-                if frame.time is not None and frame.time >= end + 0.1:
-                    break
-            for output in resampler.resample(None):
-                consume(output)
-            if not covered.all():
-                raise ManagerError("Der mittlere Fünf-Sekunden-Ausschnitt konnte nicht vollständig gelesen werden.")
+        try:
+            samples = _read_middle_seek(path, cancel)
+        except (av.FFmpegError, ValueError, ManagerError) as exc:
+            # MP3 indexes, duration headers and packet timestamps can be wrong.
+            # Reopen at the beginning rather than accepting an incomplete window.
+            check_cancelled(cancel)
+            session = _read_session.get()
+            if session is not None and session.disconnected(path, exc):
+                raise
+            samples = _read_middle_sequential(path, cancel)
     except (av.FFmpegError, OSError, ValueError) as exc:
         raise ManagerError(f"Die Musikdatei konnte nicht gelesen werden: {exc}") from exc
+    check_cancelled(cancel)
     if not np.isfinite(samples).all():
         raise ManagerError("Die Audiospur enthält ungültige Abtastwerte.")
     samples -= samples.mean()
@@ -125,6 +118,81 @@ def read_middle(path: Path, cancel: Event) -> np.ndarray:
     if rms < 1e-5:
         raise ManagerError("Der mittlere Ausschnitt enthält nur Stille oder ein zu leises Signal.")
     return samples / rms
+
+
+def _read_middle_seek(path: Path, cancel: Event) -> np.ndarray:
+    with audio_container(path) as container:
+        if not container.streams.audio:
+            raise ManagerError("Die Datei enthält keine Audiospur.")
+        stream = container.streams.audio[0]
+        duration = (float(stream.duration * stream.time_base) if stream.duration is not None
+                    else float(container.duration / av.time_base) if container.duration is not None else 0)
+        if not np.isfinite(duration) or duration <= 0:
+            raise ManagerError("Die tatsächliche Dateidauer konnte nicht ermittelt werden.")
+        if duration < WINDOW_SECONDS:
+            raise ManagerError("Die Datei ist kürzer als fünf Sekunden.")
+        origin = float((stream.start_time or 0) * stream.time_base)
+        start = (duration - WINDOW_SECONDS) / 2 + origin
+        end = start + WINDOW_SECONDS
+        # Compressed formats need a little preroll for their decoder/resampler.
+        container.seek(int(max(origin, start - 0.5) / float(stream.time_base)), stream=stream)
+        resampler = av.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
+        samples = np.zeros(SAMPLE_COUNT, dtype=np.float32)
+        covered = np.zeros(SAMPLE_COUNT, dtype=bool)
+
+        def consume(frame):
+            if frame.time is None:
+                raise ManagerError("Die Audiospur enthält keine verlässlichen Zeitangaben.")
+            offset = round((frame.time - start) * SAMPLE_RATE)
+            left, right = max(0, offset), min(SAMPLE_COUNT, offset + frame.samples)
+            if right > left:
+                samples[left:right] = frame.to_ndarray().reshape(-1)[left - offset:right - offset]
+                covered[left:right] = True
+
+        for frame in container.decode(stream):
+            check_cancelled(cancel)
+            for output in resampler.resample(frame):
+                consume(output)
+            if frame.time is not None and frame.time >= end + 0.1:
+                break
+        for output in resampler.resample(None):
+            consume(output)
+        if not covered.all():
+            raise ManagerError("Der mittlere Fünf-Sekunden-Ausschnitt konnte nicht vollständig gelesen werden.")
+        return samples
+
+
+def _read_middle_sequential(path: Path, cancel: Event) -> np.ndarray:
+    # Spool mono PCM to disk so a long file never needs to fit in RAM. Reading
+    # from the beginning avoids relying on the very seek index that failed.
+    with TemporaryFile() as pcm, audio_container(path) as container:
+        if not container.streams.audio:
+            raise ManagerError("Die Datei enthält keine Audiospur.")
+        resampler = av.AudioResampler(format="fltp", layout="mono", rate=SAMPLE_RATE)
+        count = 0
+
+        def consume(frame):
+            nonlocal count
+            check_cancelled(cancel)
+            pcm.write(frame.to_ndarray().reshape(-1).astype("<f4").tobytes())
+            count += frame.samples
+
+        for frame in container.decode(container.streams.audio[0]):
+            check_cancelled(cancel)
+            # Count actual PCM samples, independently of packet timestamps.
+            frame.pts = None
+            for output in resampler.resample(frame):
+                consume(output)
+        for output in resampler.resample(None):
+            consume(output)
+        check_cancelled(cancel)
+        if count < SAMPLE_COUNT:
+            raise ManagerError("Die Datei ist kürzer als fünf Sekunden decodierbares Audio.")
+        pcm.seek(((count - SAMPLE_COUNT) // 2) * 4)
+        samples = np.frombuffer(pcm.read(SAMPLE_COUNT * 4), dtype="<f4").copy()
+        if len(samples) != SAMPLE_COUNT:
+            raise ManagerError("Der mittlere Fünf-Sekunden-Ausschnitt konnte nicht vollständig gelesen werden.")
+        return samples
 
 
 def signature(samples: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -155,24 +223,29 @@ def similarity(first, second) -> float:
 
 def compare_tracks(tracks: tuple[Track, ...], cancel: Event, progress=None, *,
                    cache_path: Path | None = None, library_id: str = "", update=False,
-                   fallback_cache_path: Path | None = None) -> ComparisonResult:
+                   fallback_cache_path: Path | None = None, session=None) -> ComparisonResult:
     """Compare readable MP3 files within each artist, regardless of title. Never write to source files.
 
     With cache_path, persist samples and matches and decode only on initial
     indexing or update. Without it, use a disposable cache. FFT memory is bounded.
     """
+    session = session or ReadSession(cancel, progress=progress)
+    initial_generation = session.generation
     if cache_path is not None:
-        return _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fallback_cache_path)
-    return _compare_tracks(tracks, cancel, progress, lambda track: normalize(track.artist), mp3_only=True)
+        return session.scan(lambda: _compare_cached(tracks, cancel, progress, cache_path, library_id,
+                            update or session.generation != initial_generation, fallback_cache_path, session))
+    return session.scan(lambda: _compare_tracks(tracks, cancel, progress, lambda track: normalize(track.artist),
+                                               mp3_only=True, session=session))
 
 
-def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fallback_cache_path):
+def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fallback_cache_path, session=None):
     """Decode only during indexing; compare stored samples without temporary files.
 
     Pending rows make interrupted updates resumable. Only matching pairs are
     stored; completed rows also record that nonmatching pairs were checked.
     """
     report = progress or (lambda current, total, message: None)
+    session = session or ReadSession(cancel, progress=report)
     skipped, errors, checked, reused, updated = [], [], 0, 0, 0
 
     def notice(track, reason, file_error=False):
@@ -210,27 +283,28 @@ def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fa
                 stamp = None
                 try:
                     # Metadata only; never open the audio file on a cached scan.
-                    stat = Path(track.path).stat()
+                    stat = session.stat(track.path)
                     stamp = stat.st_size, stat.st_mtime_ns
                     same_file = (entry is not None and entry["path"] == key
                                  and (entry["size"], entry["mtime_ns"]) == stamp)
                     same = same_file and entry["artist"] == artist
-                    if same and entry["error"]:
+                    retry_error = bool(same and entry["error"] and update
+                                       and "Ausschnitt konnte nicht vollständig gelesen" in entry["error"])
+                    if same and entry["error"] and not retry_error:
                         notice(track, entry["error"], True)
                         continue
-                    if not same:
+                    if not same or retry_error:
                         if not update:
                             if entry is not None:
                                 store.defer(track.id)
                             notice(track, "Neue oder geänderte Vergleichsdaten. Bitte „Aktualisieren“ anklicken.")
                             continue
-                        source = store.find_file(key, stamp)
-                        if source is not None:
-                            samples = store.samples(source["id"])
+                        samples = store.cached_samples(key, stamp)
+                        if samples is not None:
                             reused += 1
                         else:
-                            samples = read_middle(Path(track.path), cancel)
-                            after = Path(track.path).stat()
+                            samples = read_samples(Path(track.path), cancel, session)
+                            after = session.stat(track.path, refresh=True)
                             if (after.st_size, after.st_mtime_ns) != stamp:
                                 raise ManagerError("Die Musikdatei wurde während des Einlesens geändert. Bitte aktualisieren.")
                             updated += 1
@@ -246,7 +320,11 @@ def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fa
                 except (ManagerError, OSError) as exc:
                     reason = str(exc)
                     notice(track, reason, True)
-                    if update and (entry is None or entry["path"] != key or entry["artist"] != artist
+                    if entry is not None and entry["ready"] and stamp is None:
+                        # A missing file is not evidence that its saved audio is
+                        # invalid. Keep it for when the file/volume returns.
+                        store.defer(track.id)
+                    elif update and (entry is None or entry["path"] != key or entry["artist"] != artist
                                    or (entry["size"], entry["mtime_ns"]) != (stamp or (None, None))
                                    or entry["error"] != reason):
                         store.put(track.id, key, artist, stamp, error=reason)
@@ -281,6 +359,7 @@ def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fa
                             report(current, total, f"Trackpaare vergleichen: {current}/{total}")
                 check_cancelled(cancel)
                 store.save_matches(batch)
+                batch.clear()
                 # Mark only after every pair was processed. Cancelled scans retry
                 # pending pairs, including nonmatches, without decoding again.
                 store.mark_compared(pending)
@@ -292,6 +371,8 @@ def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fa
                                 if first in usable and second in usable
                                 and usable[first]["artist"] == usable[second]["artist"])
             finally:
+                # Also commit the last, not-yet-full batch on a safe cancellation.
+                store.save_matches(batch)
                 load.cache_clear()
     except ComparisonCancelled:
         return ComparisonResult(skipped=tuple(skipped), checked=checked, cancelled=True,
@@ -302,12 +383,16 @@ def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fa
                             reused=reused, updated=updated, cache_path=str(cache_path))
 
 
-def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, strict=False):
+def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, strict=False,
+                    cache_path=None, library_id="", session=None):
     matches, skipped, errors, checked = [], [], [], 0
     report = progress or (lambda current, total, message: None)
+    session = session or ReadSession(cancel, progress=report)
     try:
-        with TemporaryDirectory(prefix="rekordbox-trackvergleich-") as directory:
+        with (open_comparison_store(cache_path, library_id) if cache_path is not None else nullcontext()) as store, \
+                (TemporaryDirectory(prefix="rekordbox-trackvergleich-") if store is None else nullcontext()) as directory:
             paths = {}
+            sources = {}
             artists = {}
             for index, track in enumerate(tracks):
                 check_cancelled(cancel)
@@ -323,12 +408,24 @@ def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, stri
                     if not key_for_group:
                         file_error = False
                         raise ManagerError("Kein Interpret vorhanden.")
-                    path = Path(track.path).resolve(strict=True)
+                    path = Path(path_key(track.path))
                     if path not in paths:
-                        samples = read_middle(path, cancel)
+                        stat = session.stat(path)
+                        stamp = stat.st_size, stat.st_mtime_ns
+                        samples = store.cached_samples(str(path), stamp) if store is not None else None
+                        if samples is None:
+                            samples = read_samples(path, cancel, session)
+                            after = session.stat(path, refresh=True)
+                            if (after.st_size, after.st_mtime_ns) != stamp:
+                                raise ManagerError("Die Musikdatei wurde während des Einlesens geändert. Bitte neu laden.")
+                            if store is not None:
+                                store.save_audio(str(path), stamp, samples)
                         key = len(paths)
-                        spectrum, energy = signature(samples)
-                        np.savez(Path(directory) / f"{key}.npz", spectrum=spectrum, energy=energy)
+                        if store is None:
+                            spectrum, energy = signature(samples)
+                            np.savez(Path(directory) / f"{key}.npz", spectrum=spectrum, energy=energy)
+                        else:
+                            sources[key] = str(path), stamp
                         paths[path] = key
                     artists.setdefault(key_for_group, []).append((track, paths[path]))
                     checked += 1
@@ -340,6 +437,8 @@ def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, stri
 
             @lru_cache(maxsize=32)
             def load(key):
+                if store is not None:
+                    return signature(store.cached_samples(*sources[key]))
                 with np.load(Path(directory) / f"{key}.npz") as data:
                     return data["spectrum"], data["energy"]
 
@@ -368,17 +467,19 @@ def _compare_tracks(tracks, cancel, progress, group_key, *, mp3_only=False, stri
 
 
 def verify_duplicate_groups(groups: tuple[DuplicateGroup, ...], cancel: Event | None = None,
-                            progress=None) -> tuple[tuple[DuplicateGroup, ...], tuple[str, ...]]:
+                            progress=None, *, cache_path=None, library_id="", session=None
+                            ) -> tuple[tuple[DuplicateGroup, ...], tuple[str, ...]]:
     """Confirm metadata candidates using strictly more than 90 % audio similarity.
 
     Partition each candidate group into disjoint cliques. Every possible keeper
     in a confirmed group must match every other member; similarity is not transitive.
     """
-    cancel = cancel if cancel is not None else Event()
+    cancel = cancel if cancel is not None else session.cancel if session is not None else Event()
     tracks = tuple(track for group in groups for track in group.tracks)
     if not tracks:
         return (), ()
-    result = _compare_tracks(tracks, cancel, progress, lambda track: track.duplicate_key, strict=True)
+    result = _compare_tracks(tracks, cancel, progress, lambda track: track.duplicate_key, strict=True,
+                             cache_path=cache_path, library_id=library_id, session=session)
     if result.cancelled:
         raise ComparisonCancelled()
     scores = {frozenset((match.first.id, match.second.id)): match.similarity for match in result.matches}

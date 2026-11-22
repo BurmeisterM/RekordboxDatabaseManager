@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 import struct
 import sqlite3
+import stat as stat_module
+from threading import Event
 import xml.etree.ElementTree as ET
 from uuid import uuid4
 
@@ -22,8 +24,9 @@ import psutil
 from sqlcipher3 import dbapi2 as sql
 
 from .domain import Library, ManagerError, RemovalPlan, Track, find_duplicates, validate_plan
-from .comparison import verify_duplicate_groups
-from .comparison_store import remove_cached_tracks
+from .comparison import check_cancelled, verify_duplicate_groups
+from .comparison_store import prepare_comparison_database, remove_cached_tracks
+from .io_control import ReadSession, current_session
 from .recycle import recycle_file
 
 
@@ -79,7 +82,7 @@ def validate_schema(tables: dict[str, set[str]]) -> None:
                                "Bitte die master.db auswählen; Geräte-Exporte sind eine andere Datenquelle.")
 
 
-def fingerprint(path: Path) -> tuple:
+def fingerprint(path: Path, cancel: Event | None = None, session=None) -> tuple:
     result = []
     for file in (path, Path(str(path) + "-wal"), path.parent / "masterPlaylists6.xml"):
         if not file.exists() or (file.name.endswith("-wal") and file.stat().st_size <= 32):
@@ -88,6 +91,10 @@ def fingerprint(path: Path) -> tuple:
         digest = hashlib.sha256()
         with file.open("rb") as stream:
             for block in iter(lambda: stream.read(1024 * 1024), b""):
+                if cancel is not None:
+                    check_cancelled(cancel)
+                if session is not None:
+                    session.pace(len(block))
                 digest.update(block)
         result.append(digest.hexdigest())
     return tuple(result)
@@ -117,9 +124,9 @@ def _file_available(path: Path | None) -> bool:
         return False
 
 
-def resolve_cover(value: str, database: Path) -> str:
+def cover_candidates(value: str, database: Path) -> tuple[str, ...]:
     if not value:
-        return ""
+        return ()
     normalized = value.replace("\\", "/")
     relative = normalized.lstrip("/")
     # External master databases store artwork under share/PIONEER/Artwork.
@@ -127,9 +134,14 @@ def resolve_cover(value: str, database: Path) -> str:
     for parent in list(database.parents)[:4]:
         candidates.append(parent / relative)
     candidates.append(Path(normalized))
+    return tuple(dict.fromkeys(str(candidate) for candidate in candidates))
+
+
+def resolve_cover(value: str, database: Path) -> str:
+    candidates = cover_candidates(value, database)
     for candidate in candidates:
-        if _file_available(candidate):
-            return str(candidate.resolve())
+        if _file_available(Path(candidate)):
+            return str(Path(candidate).resolve())
     return ""
 
 
@@ -165,56 +177,98 @@ def _playlist_usage(conn, tables: dict) -> tuple[dict[str, int], dict[str, tuple
                     for track_id, playlists in names.items()}
 
 
-def _read_tracks(conn, tables: dict, path: Path) -> tuple[Track, ...]:
+def _read_tracks(conn, tables: dict, path: Path, cancel: Event | None = None, progress=None,
+                 session=None) -> tuple[Track, ...]:
     playlists, playlist_names = _playlist_usage(conn, tables)
     cues = _counts(conn, tables, "djmdCue")
     result = []
+    availability, covers = {}, {}
+
+    def available(music):
+        if music is None:
+            return False
+        key = str(music)
+        if key not in availability:
+            try:
+                availability[key] = (stat_module.S_ISREG(session.stat(music).st_mode) if session is not None
+                                     else _file_available(music))
+            except OSError:
+                availability[key] = False
+        return availability[key]
+
     for row in conn.execute(
         'SELECT c.*, a.Name AS artist_name FROM djmdContent c '
         'LEFT JOIN djmdArtist a ON a.ID=c.ArtistID '
         f'WHERE {live_filter(tables["djmdContent"], "c.")}'):
+        if cancel is not None:
+            check_cancelled(cancel)
+        if progress and len(result) % 25 == 0:
+            progress(0, 0, f"Sammlung lesen: {len(result)} Titel geladen …")
         values = dict(row)
         music = audio_path(values.get("FolderPath") or "", path)
         track_id = str(row["ID"])
+        image = values.get("ImagePath") or ""
+        if image not in covers:
+            covers[image] = cover_candidates(image, path)
+        candidates = covers[image]
         result.append(Track(
             id=track_id, title=row["Title"] or "", artist=row["artist_name"] or "",
             added=values.get("StockDate") or values.get("created_at") or "",
             path=str(music) if music else (values.get("FolderPath") or ""),
-            cover=resolve_cover(values.get("ImagePath") or "", path),
+            cover=candidates[0] if candidates else "", cover_paths=candidates,
             duration=int(values.get("Length") or 0), bitrate=int(values.get("BitRate") or 0),
             playlists=playlists.get(track_id, 0), cues=cues.get(track_id, 0),
-            available=_file_available(music),
+            available=available(music),
             playlist_names=playlist_names.get(track_id, ()),
         ))
     return tuple(sorted(result, key=lambda t: (t.title.casefold(), t.artist.casefold(), t.id)))
 
 
-def load_library(path: str | Path, *, verify_audio: bool = True) -> Library:
+def load_library(path: str | Path, *, verify_audio: bool = True,
+                 cancel: Event | None = None, progress=None, session=None) -> Library:
+    session = session or current_session.get() or ReadSession(cancel if cancel is not None else Event(), progress=progress)
+    cancel = cancel if cancel is not None else session.cancel
+    return session.scan(lambda: session.call(path, lambda: _load_library(
+        path, verify_audio=verify_audio, cancel=cancel, progress=progress, session=session)))
+
+
+def _load_library(path, *, verify_audio, cancel, progress, session):
+    if cancel is not None:
+        check_cancelled(cancel)
     path = Path(path).resolve()
     if path.suffix.casefold() != ".db":
         raise ManagerError("Bitte eine master.db auswählen. export.pdb und XML-Dateien werden nicht bearbeitet.")
     try:
-        before = fingerprint(path)
+        before = session.call(path, lambda: fingerprint(path, cancel, session))
         with path.open("rb") as file:
             encrypted = file.read(16) != b"SQLite format 3\x00"
         with closing(connect(path, encrypted=encrypted)) as conn:
+            if cancel is not None:
+                conn.set_progress_handler(lambda: int(cancel.is_set()), 1000)
             conn.execute("BEGIN")
             tables = schema(conn)
             validate_schema(tables)
             check_integrity(conn)
-            tracks = _read_tracks(conn, tables, path)
+            tracks = _read_tracks(conn, tables, path, cancel, progress, session)
             db_id = ""
             if "DBID" in tables.get("djmdProperty", set()):
                 row = conn.execute("SELECT DBID FROM djmdProperty LIMIT 1").fetchone()
                 db_id = str(row[0]) if row else ""
-        after = fingerprint(path)
+        after = session.call(path, lambda: fingerprint(path, cancel, session))
         if before != after:
             raise ManagerError("Die Datenbank wurde während des Lesens geändert. Bitte Rekordbox schließen und neu laden.")
-        groups, notices = verify_duplicate_groups(find_duplicates(tracks)) if verify_audio else ((), ())
+        candidates = find_duplicates(tracks) if verify_audio else ()
+        groups, notices = (verify_duplicate_groups(candidates, cancel, progress,
+                           cache_path=prepare_comparison_database(path, session), library_id=db_id, session=session)
+                          if candidates else ((), ()))
+        if cancel is not None:
+            check_cancelled(cancel)
         return Library(path, tracks, after, encrypted, db_id, groups, notices)
     except ManagerError:
         raise
-    except (sql.Error, OSError, ValueError) as exc:
+    except (sql.Error, sqlite3.Error, OSError, ValueError) as exc:
+        if cancel is not None:
+            check_cancelled(cancel)
         raise ManagerError("Die Datenbank konnte nicht geöffnet werden. Bitte die master.db samt "
                            "zugehörigen WAL-Dateien verwenden und den Laufwerkszugriff prüfen.\n\n"
                            f"Details: {exc}") from exc
@@ -394,7 +448,8 @@ def _library_after_rename(library: Library, affected_ids: set[str], track_id: st
                  path=str(destination), available=True) if track.id in affected_ids else track
          for track in library.tracks),
         key=lambda track: (track.title.casefold(), track.artist.casefold(), track.id)))
-    groups, notices = verify_duplicate_groups(find_duplicates(tracks))
+    groups, notices = verify_duplicate_groups(find_duplicates(tracks),
+                      cache_path=prepare_comparison_database(library.path), library_id=library.db_id)
     return replace(library, tracks=tracks, fingerprint=state, groups=groups, duplicate_notices=notices)
 
 

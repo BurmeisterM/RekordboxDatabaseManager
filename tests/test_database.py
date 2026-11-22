@@ -369,12 +369,12 @@ def test_unreachable_artwork_does_not_block_collection(collection, monkeypatch):
 
     def hardware_failure(self, *args, **kwargs):
         if self.name == "cover.png":
-            raise OSError(483, "Schwerwiegender Hardwarefehler", str(self))
+            pytest.fail("Artwork must not be probed while loading metadata")
         return stat(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "stat", hardware_failure)
     library = db.load_library(path, verify_audio=False)
-    assert len(library.tracks) == 3 and not any(track.cover for track in library.tracks)
+    assert len(library.tracks) == 3 and all(track.cover_paths for track in library.tracks)
 
 
 def test_real_testdata_on_an_isolated_copy(tmp_path, monkeypatch, synthetic_mp3_audio):

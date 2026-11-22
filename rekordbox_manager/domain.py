@@ -51,6 +51,7 @@ class Track:
     cues: int = 0
     available: bool = False
     playlist_names: tuple[str, ...] = ()
+    cover_paths: tuple[str, ...] = ()
 
     @property
     def filename(self) -> str:
