@@ -108,6 +108,15 @@ def live_filter(columns: set[str], prefix: str = "") -> str:
     return f"COALESCE({prefix}rb_local_deleted, 0)=0" if "rb_local_deleted" in columns else "1=1"
 
 
+def _file_available(path: Path | None) -> bool:
+    try:
+        return bool(path and path.is_file())
+    except OSError:
+        # A disconnected or failing music/artwork drive must not prevent
+        # reading the collection metadata. The comparison reports file errors.
+        return False
+
+
 def resolve_cover(value: str, database: Path) -> str:
     if not value:
         return ""
@@ -119,7 +128,7 @@ def resolve_cover(value: str, database: Path) -> str:
         candidates.append(parent / relative)
     candidates.append(Path(normalized))
     for candidate in candidates:
-        if candidate.is_file():
+        if _file_available(candidate):
             return str(candidate.resolve())
     return ""
 
@@ -174,7 +183,7 @@ def _read_tracks(conn, tables: dict, path: Path) -> tuple[Track, ...]:
             cover=resolve_cover(values.get("ImagePath") or "", path),
             duration=int(values.get("Length") or 0), bitrate=int(values.get("BitRate") or 0),
             playlists=playlists.get(track_id, 0), cues=cues.get(track_id, 0),
-            available=bool(music and music.is_file()),
+            available=_file_available(music),
             playlist_names=playlist_names.get(track_id, ()),
         ))
     return tuple(sorted(result, key=lambda t: (t.title.casefold(), t.artist.casefold(), t.id)))

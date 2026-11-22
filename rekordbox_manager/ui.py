@@ -28,7 +28,7 @@ from .domain import Library, ManagerError, RemovalPlan, Track, display_date, nor
 from .playback import AudioPreview
 from .comparison import compare_tracks, comparison_groups
 from .comparison_ui import ComparisonPage
-from .comparison_store import comparison_database_path
+from .comparison_store import comparison_database_path, local_comparison_database_path
 
 
 STYLE = """
@@ -901,6 +901,7 @@ class MainWindow(QMainWindow):
             source = load_library(library.path, verify_audio=False) if update else library
             result = compare_tracks(source.tracks, cancel, report,
                                     cache_path=comparison_database_path(source.path),
+                                    fallback_cache_path=local_comparison_database_path(source.path),
                                     library_id=source.db_id, update=update)
             groups = comparison_groups(result)
             if cancel.is_set():
@@ -1280,7 +1281,7 @@ class MainWindow(QMainWindow):
             "Nicht lesbare, zu kurze oder stille Kandidaten werden mit Grund ausgelassen.\n\n"
             "Trackvergleich: Nur MP3-Dateien desselben Interpreten werden verglichen. Je Datei werden fünf Sekunden um die tatsächliche Mitte "
             "verglichen. Treffer ab 90 % erscheinen in Gruppen mit denselben Funktionen wie beim Titelvergleich. "
-            "Beim ersten Start wird neben der master.db eine Vergleichsdatenbank aufgebaut. Weitere Starts verwenden die gespeicherten Daten. "
+            "Beim ersten Start wird eine Vergleichsdatenbank neben der master.db aufgebaut. Ohne Schreibzugriff wird sie lokal im Benutzerprofil gespeichert. Weitere Starts verwenden die gespeicherten Daten. "
             "„Aktualisieren“ gleicht den aktuellen Sammlungsbestand ab und liest nur neue oder geänderte Dateien ein. "
             "Gelöschte Tracks werden auch aus der Vergleichsdatenbank entfernt. "
             "Alle Mitglieder einer Gruppe stimmen untereinander überein. "

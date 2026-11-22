@@ -344,12 +344,55 @@ def test_missing_metadata_is_not_grouped_and_tombstones_are_hidden(collection):
     assert len(library.tracks) == 2 and not library.groups
 
 
+def test_unreachable_audio_does_not_block_metadata_and_is_reported_by_comparison(collection, monkeypatch):
+    path, _ = collection
+    broken = path.parent / "copy.mp3"
+    stat = Path.stat
+
+    def hardware_failure(self, *args, **kwargs):
+        if self == broken:
+            raise OSError(483, "Schwerwiegender Hardwarefehler", str(self))
+        return stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", hardware_failure)
+    library = db.load_library(path, verify_audio=False)
+    assert len(library.tracks) == 3 and not library.by_id["copy"].available
+    assert library.by_id["original"].available
+    result = compare_tracks(library.tracks, Event(), cache_path=comparison_database_path(path))
+    assert result.checked == 2 and len(result.errors) == 1
+    assert str(broken) in result.errors[0] and "Hardwarefehler" in result.errors[0]
+
+
+def test_unreachable_artwork_does_not_block_collection(collection, monkeypatch):
+    path, _ = collection
+    stat = Path.stat
+
+    def hardware_failure(self, *args, **kwargs):
+        if self.name == "cover.png":
+            raise OSError(483, "Schwerwiegender Hardwarefehler", str(self))
+        return stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", hardware_failure)
+    library = db.load_library(path, verify_audio=False)
+    assert len(library.tracks) == 3 and not any(track.cover for track in library.tracks)
+
+
 def test_real_testdata_on_an_isolated_copy(tmp_path, monkeypatch, synthetic_mp3_audio):
     source = Path(__file__).resolve().parents[1] / "RecordBox Testdata" / "PIONEER" / "Master" / "master.db"
     if not source.is_file():
         pytest.skip("Local Rekordbox sample is not included in the repository")
     monkeypatch.setattr(db, "require_rekordbox_closed", lambda: None)
     monkeypatch.setattr(db, "recycle_file", lambda file: pytest.fail("Original audio must remain protected"))
+    real_audio_path = db.audio_path
+
+    def isolated_audio_path(value, database):
+        audio = real_audio_path(value, database)
+        if audio and not audio.is_relative_to(tmp_path):
+            # Inspect the sample database without touching its real audio drive.
+            return tmp_path / "unavailable-source-audio" / audio.name
+        return audio
+
+    monkeypatch.setattr(db, "audio_path", isolated_audio_path)
     before = db.fingerprint(source)
     library = db.load_library(source)
     assert library.tracks

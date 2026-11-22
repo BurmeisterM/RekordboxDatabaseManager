@@ -1,6 +1,7 @@
 """Persistent, disposable audio cache, separate from the Rekordbox database."""
 
 from contextlib import closing
+from hashlib import sha256
 import os
 from pathlib import Path
 import sqlite3
@@ -13,7 +14,37 @@ ALGORITHM_VERSION = "middle-5s-mono-8000-f32-correlation-250ms-v1"
 
 
 def comparison_database_path(library_path: Path) -> Path:
+    local = local_comparison_database_path(library_path)
+    # Once a fallback has been built, keep using it after a restart even if
+    # the original drive becomes writable again.
+    if local.is_file():
+        return local
     return Path(library_path).with_suffix(".trackvergleich.sqlite3")
+
+
+def local_comparison_database_path(library_path: Path) -> Path:
+    root = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    identity = sha256(path_key(str(library_path)).encode("utf-8")).hexdigest()
+    return root / "RekordboxDatabaseManager" / "Trackvergleich" / identity / "master.trackvergleich.sqlite3"
+
+
+def open_comparison_store(path: Path, library_id: str = "", fallback_path: Path | None = None):
+    """Fall back only for access errors during opening, never for corrupt data."""
+    try:
+        return ComparisonStore(path, library_id)
+    except sqlite3.OperationalError as exc:
+        code = getattr(exc, "sqlite_errorcode", 0) & 0xff
+        if fallback_path is None or Path(path) == Path(fallback_path) or code not in (
+                sqlite3.SQLITE_CANTOPEN, sqlite3.SQLITE_READONLY, sqlite3.SQLITE_PERM):
+            raise
+        try:
+            fallback_path = Path(fallback_path)
+            fallback_path.parent.mkdir(parents=True, exist_ok=True)
+            return ComparisonStore(fallback_path, library_id)
+        except (sqlite3.Error, OSError) as fallback_error:
+            raise OSError(f"Sammlungsordner: {path}\n{exc}\n"
+                          f"Lokale Ausweichablage: {fallback_path}\n{fallback_error}\n"
+                          "Bitte Erreichbarkeit, Schreibrechte und freien Speicher prüfen.") from fallback_error
 
 
 def path_key(path: str) -> str:
@@ -46,6 +77,10 @@ class ComparisonStore:
                 CREATE INDEX IF NOT EXISTS tracks_file ON tracks(path, size, mtime_ns);
             """)
             metadata = dict(self.connection.execute("SELECT key, value FROM metadata").fetchall())
+            # An existing schema can be read from a read-only file. Verify that
+            # writes (including the rollback journal) work before accepting it.
+            with self.connection:
+                self.connection.execute("UPDATE metadata SET value=value WHERE key='algorithm'")
             identity = {"algorithm": ALGORITHM_VERSION, "library_id": library_id}
             if any(metadata.get(key) != value for key, value in identity.items()):
                 with self.connection:
@@ -125,10 +160,20 @@ class ComparisonStore:
 
 def remove_cached_tracks(library_path: Path, ids):
     """After a successful Rekordbox commit, remove cache rows and dependent pairs."""
-    path = comparison_database_path(library_path)
-    if not path.is_file():
-        return
-    with closing(sqlite3.connect(str(path), timeout=5)) as connection:
-        connection.execute("PRAGMA foreign_keys=ON")
-        with connection:
-            connection.executemany("DELETE FROM tracks WHERE id=?", ((key,) for key in ids))
+    ids = tuple(ids)
+    errors = []
+    # Both may exist after falling back. Clean both so an old adjacent cache
+    # cannot resurrect deleted entries if the local cache is later removed.
+    for path in (local_comparison_database_path(library_path),
+                 Path(library_path).with_suffix(".trackvergleich.sqlite3")):
+        try:
+            if not path.is_file():
+                continue
+            with closing(sqlite3.connect(str(path), timeout=5)) as connection:
+                connection.execute("PRAGMA foreign_keys=ON")
+                with connection:
+                    connection.executemany("DELETE FROM tracks WHERE id=?", ((key,) for key in ids))
+        except (sqlite3.Error, OSError) as exc:
+            errors.append(f"{path}: {exc}")
+    if errors:
+        raise OSError("\n".join(errors))

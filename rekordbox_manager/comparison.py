@@ -12,7 +12,7 @@ import av
 import numpy as np
 
 from .domain import DuplicateGroup, ManagerError, Track, normalize, recommendation_rank
-from .comparison_store import ComparisonStore, path_key
+from .comparison_store import ComparisonStore, open_comparison_store, path_key
 
 
 SAMPLE_RATE = 8000
@@ -154,18 +154,19 @@ def similarity(first, second) -> float:
 
 
 def compare_tracks(tracks: tuple[Track, ...], cancel: Event, progress=None, *,
-                   cache_path: Path | None = None, library_id: str = "", update=False) -> ComparisonResult:
+                   cache_path: Path | None = None, library_id: str = "", update=False,
+                   fallback_cache_path: Path | None = None) -> ComparisonResult:
     """Compare readable MP3 files within each artist, regardless of title. Never write to source files.
 
     With cache_path, persist samples and matches and decode only on initial
     indexing or update. Without it, use a disposable cache. FFT memory is bounded.
     """
     if cache_path is not None:
-        return _compare_cached(tracks, cancel, progress, cache_path, library_id, update)
+        return _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fallback_cache_path)
     return _compare_tracks(tracks, cancel, progress, lambda track: normalize(track.artist), mp3_only=True)
 
 
-def _compare_cached(tracks, cancel, progress, cache_path, library_id, update):
+def _compare_cached(tracks, cancel, progress, cache_path, library_id, update, fallback_cache_path):
     """Decode only during indexing; compare stored samples without temporary files.
 
     Pending rows make interrupted updates resumable. Only matching pairs are
@@ -183,7 +184,8 @@ def _compare_cached(tracks, cancel, progress, cache_path, library_id, update):
 
     try:
         check_cancelled(cancel)
-        with ComparisonStore(cache_path, library_id) as store:
+        with open_comparison_store(cache_path, library_id, fallback_cache_path) as store:
+            cache_path = store.path
             update = update or not store.initialized
             eligible = {t.id for t in tracks if t.path and Path(t.path).suffix.casefold() == ".mp3"
                         and normalize(t.artist)}

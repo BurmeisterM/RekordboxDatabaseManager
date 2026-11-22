@@ -19,7 +19,7 @@ from rekordbox_manager.database import load_library
 from rekordbox_manager.domain import DuplicateGroup, ManagerError, RemovalPlan, validate_plan
 from rekordbox_manager.ui import MainWindow, RemovalDialog, Task, TrackModel, app_settings
 from rekordbox_manager.comparison import AudioMatch, ComparisonResult, compare_tracks
-from rekordbox_manager.comparison_store import comparison_database_path
+from rekordbox_manager.comparison_store import comparison_database_path, local_comparison_database_path
 
 
 @pytest.fixture(autouse=True)
@@ -194,6 +194,23 @@ def test_track_comparison_removal_uses_audio_groups_and_preserves_playlist_posit
         assert cache.execute("SELECT id FROM tracks").fetchall() == [("remix",)]
         assert cache.execute("SELECT * FROM matches").fetchall() == []
     assert not window.title_model.selected
+    window.close()
+
+
+def test_track_comparison_uses_local_fallback_and_shows_actual_path(qt_app, collection):
+    library = load_library(collection[0])
+    # A directory in place of the SQLite file produces the same CANTOPEN error.
+    comparison_database_path(library.path).mkdir()
+    window = MainWindow()
+    window.loaded(library)
+    window.compare_button.click()
+    window.comparison_page.start_button.click()
+    wait_for_window(window)
+    page = window.comparison_page
+    local = local_comparison_database_path(library.path)
+    assert page.result is not None and page.result.cache_path == str(local)
+    assert str(local) in page.status.toolTip()
+    assert len(page.model.rows) == 3 and not page.running
     window.close()
 
 

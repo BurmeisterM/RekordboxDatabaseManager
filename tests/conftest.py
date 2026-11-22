@@ -13,6 +13,11 @@ from sqlcipher3 import dbapi2 as sql
 from rekordbox_manager import database
 
 
+@pytest.fixture(autouse=True)
+def isolate_comparison_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local-app-data"))
+
+
 @pytest.fixture
 def collection(tmp_path, monkeypatch, synthetic_mp3_audio):
     """A small encrypted collection with committed changes living in its WAL."""
