@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import struct
+import sqlite3
 import xml.etree.ElementTree as ET
 from uuid import uuid4
 
@@ -22,6 +23,7 @@ from sqlcipher3 import dbapi2 as sql
 
 from .domain import Library, ManagerError, RemovalPlan, Track, find_duplicates, validate_plan
 from .comparison import verify_duplicate_groups
+from .comparison_store import remove_cached_tracks
 from .recycle import recycle_file
 
 
@@ -178,7 +180,7 @@ def _read_tracks(conn, tables: dict, path: Path) -> tuple[Track, ...]:
     return tuple(sorted(result, key=lambda t: (t.title.casefold(), t.artist.casefold(), t.id)))
 
 
-def load_library(path: str | Path) -> Library:
+def load_library(path: str | Path, *, verify_audio: bool = True) -> Library:
     path = Path(path).resolve()
     if path.suffix.casefold() != ".db":
         raise ManagerError("Bitte eine master.db auswählen. export.pdb und XML-Dateien werden nicht bearbeitet.")
@@ -199,7 +201,7 @@ def load_library(path: str | Path) -> Library:
         after = fingerprint(path)
         if before != after:
             raise ManagerError("Die Datenbank wurde während des Lesens geändert. Bitte Rekordbox schließen und neu laden.")
-        groups, notices = verify_duplicate_groups(find_duplicates(tracks))
+        groups, notices = verify_duplicate_groups(find_duplicates(tracks)) if verify_audio else ((), ())
         return Library(path, tracks, after, encrypted, db_id, groups, notices)
     except ManagerError:
         raise
@@ -695,6 +697,11 @@ def remove_duplicates(library: Library, plan: RemovalPlan, *, backup_root: Path 
     # never be reported as a rollback of an already committed database change.
     warnings, trashed, notices = [], [], []
     if committed:
+        try:
+            remove_cached_tracks(path, plan.replacements)
+        except (sqlite3.Error, OSError) as exc:
+            warnings.append(f"Die Vergleichsdatenbank konnte nicht bereinigt werden. "
+                            f"Bitte im Trackvergleich aktualisieren.\n{exc}")
         manifest["status"] = "database_committed"
         try:
             _write_manifest(backup, manifest)

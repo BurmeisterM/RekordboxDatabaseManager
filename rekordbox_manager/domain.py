@@ -13,7 +13,7 @@ class ManagerError(Exception):
 
 
 def normalize(value: str) -> str:
-    # Keep punctuation and all mix/remix designations intact.
+    # Normalize text without removing punctuation or mix/remix designations.
     return " ".join(unicodedata.normalize("NFC", value).casefold().split())
 
 
@@ -22,7 +22,7 @@ def duplicate_artist(value: str) -> str:
 
 
 def duplicate_title(value: str) -> str:
-    return normalize(normalize(value).replace("(original)", " "))
+    return normalize(normalize(value).replace("(original)", " ").replace("(original mix)", " "))
 
 
 def date_key(value: str) -> str:

@@ -28,6 +28,7 @@ from .domain import Library, ManagerError, RemovalPlan, Track, display_date, nor
 from .playback import AudioPreview
 from .comparison import compare_tracks, comparison_groups
 from .comparison_ui import ComparisonPage
+from .comparison_store import comparison_database_path
 
 
 STYLE = """
@@ -604,6 +605,7 @@ class MainWindow(QMainWindow):
         self.active_task = None
         self.comparison_view = False
         self.comparison_cancel = None
+        self.comparison_source: Library | None = None
         self.last_backup: Path | None = None
         self.settings = app_settings()
         self.model = TrackModel()
@@ -794,6 +796,7 @@ class MainWindow(QMainWindow):
         content.addWidget(self.splitter, 1)
         self.comparison_page = ComparisonPage(self.comparison_model)
         self.comparison_page.start_requested.connect(self.start_comparison)
+        self.comparison_page.update_requested.connect(self.update_comparison)
         self.comparison_page.cancel_requested.connect(self.cancel_comparison)
         self.comparison_page.hide()
         content.insertWidget(content.indexOf(self.splitter), self.comparison_page)
@@ -876,31 +879,40 @@ class MainWindow(QMainWindow):
         self.set_comparison_controls(True)
         self.heading.setText("Trackvergleich")
         self.description.setText("MP3-Audiovergleich innerhalb desselben Interpreten: fünf Sekunden um die Dateimitte · mindestens 90 % Signalähnlichkeit. "
-                                 "Treffer gelten für diesen Ausschnitt.")
+                                 "Gespeicherte Vergleichsdaten verwenden; neue oder geänderte Tracks mit „Aktualisieren“ einlesen.")
         self.description.setWordWrap(True)
         self.model.refresh()
         self.update_summary()
 
-    def start_comparison(self):
+    def update_comparison(self):
+        self.start_comparison(update=True)
+
+    def start_comparison(self, *, update=False):
         if self.busy or not self.library:
             return
-        tracks = self.library.tracks
+        library = self.comparison_source or self.library
         self.comparison_cancel = Event()
         cancel = self.comparison_cancel
         self.comparison_page.start()
 
         def compare(report):
-            result = compare_tracks(tracks, cancel, report)
+            # Read only collection metadata when updating: the title comparison
+            # must not decode unchanged candidates as a side effect of this scan.
+            source = load_library(library.path, verify_audio=False) if update else library
+            result = compare_tracks(source.tracks, cancel, report,
+                                    cache_path=comparison_database_path(source.path),
+                                    library_id=source.db_id, update=update)
             groups = comparison_groups(result)
             if cancel.is_set():
                 result = replace(result, matches=(), cancelled=True)
                 groups = ()
-            return result, groups
+            return result, replace(source, groups=groups)
 
         def completed(output):
-            result, groups = output
+            result, source = output
             self.comparison_cancel = None
-            self.comparison_page.finish(result, replace(self.library, groups=groups))
+            self.comparison_source = source
+            self.comparison_page.finish(result, source)
             self.reset_details()
             self.status_label.setText(self.comparison_page.status.text())
             self.update_summary()
@@ -912,7 +924,7 @@ class MainWindow(QMainWindow):
             self.task_failed(message)
 
         self.run_task(compare, completed,
-                      "Trackvergleich läuft · Audioausschnitte werden nur gelesen …", failure=failed,
+                      "Trackvergleich läuft · Vergleichsdatenbank wird geprüft …", failure=failed,
                       progress=self.comparison_page.report_progress)
 
     def cancel_comparison(self):
@@ -993,6 +1005,7 @@ class MainWindow(QMainWindow):
         self.startup_timer.stop()
         self.preview.stop()
         self.library = library
+        self.comparison_source = library
         self.comparison_page.reset()
         self.title_model.set_library(library)
         self.duplicate_notices.setPlainText("Nicht prüfbare Duplikatkandidaten:\n\n" + "\n\n".join(library.duplicate_notices))
@@ -1059,7 +1072,8 @@ class MainWindow(QMainWindow):
             return
         count = len(self.model.selected)
         if self.library:
-            self.total_stat.setText(f"{len(self.library.tracks):,}".replace(",", "."))
+            source = self.model.library or self.library
+            self.total_stat.setText(f"{len(source.tracks):,}".replace(",", "."))
             self.dupe_stat.setText(str(len(self.model.library.groups) if self.model.library else 0))
             self.selected_stat.setText(str(count))
             visible = {t.id for t in self.model.rows}
@@ -1147,11 +1161,11 @@ class MainWindow(QMainWindow):
             self.table.edit(index)
 
     def save_title(self, track_id, title):
-        if self.busy or not self.library or track_id not in self.library.by_id:
+        library = self.model.library or self.library
+        if self.busy or not library or track_id not in library.by_id:
             return
-        if title.strip() == self.library.by_id[track_id].title:
+        if title.strip() == library.by_id[track_id].title:
             return
-        library = self.library
         self.run_task(lambda: rename_track(library, track_id, title), self.title_saved,
                       "Titel und Dateiverknüpfung werden gespeichert…")
 
@@ -1260,12 +1274,15 @@ class MainWindow(QMainWindow):
             "„Interpret - Titel“ mit ihrer bisherigen Dateiendung um. Escape oder Verlassen des Feldes bricht ab. "
             "Dateiverknüpfungen werden aktualisiert und Duplikatgruppen neu geprüft; die Lösch-Auswahl wird zurückgesetzt.\n\n"
             "Doppelte Titel: Die Vorauswahl ignoriert Groß-/Kleinschreibung und überzählige Leerzeichen, "
-            "beim Interpreten zusätzlich + und &, beim Titel (Original). Andere Mix-Namen und Satzzeichen bleiben relevant. "
+            "beim Interpreten zusätzlich + und &, beim Titel (Original) und (Original Mix). Andere Mix-Namen und Satzzeichen bleiben relevant. "
             "Anschließend werden fünf Sekunden aus der tatsächlichen Dateimitte verglichen. "
             "Nur Gruppen mit mehr als 90 % Signalähnlichkeit werden als Duplikate angezeigt. "
             "Nicht lesbare, zu kurze oder stille Kandidaten werden mit Grund ausgelassen.\n\n"
             "Trackvergleich: Nur MP3-Dateien desselben Interpreten werden verglichen. Je Datei werden fünf Sekunden um die tatsächliche Mitte "
             "verglichen. Treffer ab 90 % erscheinen in Gruppen mit denselben Funktionen wie beim Titelvergleich. "
+            "Beim ersten Start wird neben der master.db eine Vergleichsdatenbank aufgebaut. Weitere Starts verwenden die gespeicherten Daten. "
+            "„Aktualisieren“ gleicht den aktuellen Sammlungsbestand ab und liest nur neue oder geänderte Dateien ein. "
+            "Gelöschte Tracks werden auch aus der Vergleichsdatenbank entfernt. "
             "Alle Mitglieder einer Gruppe stimmen untereinander überein. "
             "„Fehlerhafte Dateien drucken“ öffnet eine Druckvorschau mit vollständigen Pfaden und Fehlergründen.\n\n"
             "Vorschläge übernehmen wirkt auf sichtbare Gruppen; eine gefilterte Duplikatgruppe bleibt vollständig sichtbar. "

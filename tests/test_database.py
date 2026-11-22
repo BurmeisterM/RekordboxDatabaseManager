@@ -1,5 +1,6 @@
 from contextlib import closing
 import json
+import sqlite3
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -7,6 +8,9 @@ import pytest
 
 from rekordbox_manager import database as db
 from rekordbox_manager.domain import ManagerError, RemovalPlan
+from rekordbox_manager.comparison import compare_tracks
+from rekordbox_manager.comparison_store import comparison_database_path
+from threading import Event
 
 
 def test_encrypted_read_includes_wal_and_resolves_artwork(collection):
@@ -23,6 +27,44 @@ def test_encrypted_read_includes_wal_and_resolves_artwork(collection):
     assert library.by_id["remix"].playlist_names == ()
     assert library.by_id["copy"].bitrate == 320
     assert db.fingerprint(path) == before
+
+
+def test_metadata_snapshot_does_not_decode_audio(collection, monkeypatch):
+    monkeypatch.setattr(db, "verify_duplicate_groups", lambda *args: pytest.fail("Metadata-only load must not decode audio"))
+    library = db.load_library(collection[0], verify_audio=False)
+    assert len(library.tracks) == 3 and not library.groups and not library.duplicate_notices
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_removal_updates_comparison_cache_only_after_commit(collection, monkeypatch, fail):
+    path, _ = collection
+    library = db.load_library(path)
+    cache_path = comparison_database_path(path)
+    compare_tracks(library.tracks, Event(), cache_path=cache_path, library_id=library.db_id)
+    before = cache_path.read_bytes()
+    plan = RemovalPlan({"copy": "original"})
+    if fail:
+        def reject(*args):
+            raise ManagerError("Simulated removal failure")
+        monkeypatch.setattr(db, "_remove_rows", reject)
+        with pytest.raises(ManagerError, match="Simulated"):
+            db.remove_duplicates(library, plan)
+        assert cache_path.read_bytes() == before
+    else:
+        result = db.remove_duplicates(library, plan)
+        assert not result.warnings
+        with closing(sqlite3.connect(cache_path)) as cache:
+            assert {row[0] for row in cache.execute("SELECT id FROM tracks")} == {"original", "remix"}
+            assert cache.execute("SELECT first_id, second_id FROM matches").fetchall() == [("original", "remix")]
+
+
+def test_cache_error_does_not_misreport_committed_removal_as_rollback(collection):
+    path, _ = collection
+    library = db.load_library(path)
+    comparison_database_path(path).write_bytes(b"corrupt cache")
+    result = db.remove_duplicates(library, RemovalPlan({"copy": "original"}))
+    assert result.removed == 1 and any("Vergleichsdatenbank" in warning for warning in result.warnings)
+    assert "copy" not in db.load_library(path).by_id
 
 
 def test_playlist_names_cover_multiple_playlists_and_repeated_entries(collection):

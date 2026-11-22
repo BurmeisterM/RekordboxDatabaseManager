@@ -1,4 +1,6 @@
 import time
+from contextlib import closing
+import sqlite3
 from dataclasses import replace
 from threading import Event
 import wave
@@ -17,6 +19,7 @@ from rekordbox_manager.database import load_library
 from rekordbox_manager.domain import DuplicateGroup, ManagerError, RemovalPlan, validate_plan
 from rekordbox_manager.ui import MainWindow, RemovalDialog, Task, TrackModel, app_settings
 from rekordbox_manager.comparison import AudioMatch, ComparisonResult, compare_tracks
+from rekordbox_manager.comparison_store import comparison_database_path
 
 
 @pytest.fixture(autouse=True)
@@ -65,9 +68,9 @@ def test_track_comparison_menu_and_background_scan(qt_app, collection, tmp_path,
         tracks.append(replace(track, path=str(mp3_path), title=f"Unterschiedlicher Titel {index}"))
     threads = []
 
-    def compare(*args):
+    def compare(*args, **kwargs):
         threads.append(QThread.currentThread())
-        return compare_tracks(*args)
+        return compare_tracks(*args, **kwargs)
 
     monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", compare)
     window = MainWindow()
@@ -187,6 +190,9 @@ def test_track_comparison_removal_uses_audio_groups_and_preserves_playlist_posit
     assert conn.execute("SELECT ContentID, TrackNo FROM djmdSongPlaylist ORDER BY TrackNo").fetchall() == [
         ("remix", 1), ("remix", 2)]
     assert not window.comparison_model.rows and window.comparison_page.result is None
+    with closing(sqlite3.connect(comparison_database_path(path))) as cache:
+        assert cache.execute("SELECT id FROM tracks").fetchall() == [("remix",)]
+        assert cache.execute("SELECT * FROM matches").fetchall() == []
     assert not window.title_model.selected
     window.close()
 
@@ -194,7 +200,7 @@ def test_track_comparison_removal_uses_audio_groups_and_preserves_playlist_posit
 def test_track_comparison_can_be_cancelled_and_restarted(qt_app, collection, monkeypatch):
     started = Event()
 
-    def compare(tracks, cancel, progress):
+    def compare(tracks, cancel, progress, **kwargs):
         started.set()
         assert cancel.wait(5)
         return ComparisonResult(cancelled=True)
@@ -214,7 +220,7 @@ def test_track_comparison_can_be_cancelled_and_restarted(qt_app, collection, mon
 
 
 def test_track_comparison_failure_restores_controls(qt_app, collection, monkeypatch):
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise ManagerError("Testfehler")
 
     warnings = []
@@ -236,7 +242,78 @@ def test_track_comparison_disabled_without_library(qt_app):
     wait_for_window(window)
     window.compare_button.click()
     assert not window.comparison_page.start_button.isEnabled()
+    assert not window.comparison_page.update_button.isEnabled()
     assert not window.comparison_page.print_button.isEnabled()
+    window.close()
+
+
+def test_track_comparison_update_reads_fresh_collection_and_only_new_audio(qt_app, collection, tmp_path, monkeypatch):
+    from rekordbox_manager import comparison
+    path, conn = collection
+    window = MainWindow()
+    window.loaded(load_library(path))
+    window.compare_button.click()
+    page = window.comparison_page
+    page.start_button.click()
+    assert not page.update_button.isEnabled()
+    wait_for_window(window)
+    assert page.result.updated == 3 and page.update_button.isEnabled()
+    extra = tmp_path / "new.mp3"
+    extra.write_bytes((tmp_path / "copy.mp3").read_bytes())
+    conn.execute("""INSERT INTO djmdContent (ID, Title, ArtistID, FolderPath, BitRate)
+                    SELECT 'new', 'New', ArtistID, ?, 128 FROM djmdContent WHERE ID='copy'""", (str(extra),))
+    conn.commit()
+    reads = []
+    real_read = comparison.read_middle
+
+    def read(audio_path, cancel):
+        reads.append(audio_path)
+        return real_read(audio_path, cancel)
+
+    monkeypatch.setattr(comparison, "read_middle", read)
+    monkeypatch.setattr("rekordbox_manager.database.verify_duplicate_groups",
+                        lambda *args: pytest.fail("Metadata refresh must not trigger title audio verification"))
+    page.update_button.click()
+    wait_for_window(window)
+    assert reads == [extra] and page.result.updated == 1 and page.result.reused == 3
+    assert {track.id for track in page.model.rows} == {"copy", "original", "remix", "new"}
+    assert window.total_stat.text() == "4"
+    # The latest snapshot must support editing newly discovered tracks as well.
+    saved = []
+    monkeypatch.setattr("rekordbox_manager.ui.rename_track", lambda library, track_id, title: saved.append((library, track_id)))
+    monkeypatch.setattr(window, "title_saved", lambda result: None)
+    window.save_title("new", "Changed")
+    wait_for_window(window)
+    assert saved and "new" in saved[0][0].by_id
+    page.start_button.click()
+    wait_for_window(window)
+    assert reads == [extra] and page.result.updated == 0 and page.result.reused == 4
+    # A failed scan clears the display but must keep the latest source snapshot.
+    warnings = []
+    real_compare = compare_tracks
+
+    def fail_once(*args, **kwargs):
+        raise ManagerError("Temporary comparison failure")
+
+    monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", fail_once)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: warnings.append(args))
+    page.start_button.click()
+    wait_for_window(window)
+    assert warnings
+    monkeypatch.setattr("rekordbox_manager.ui.compare_tracks", real_compare)
+    page.start_button.click()
+    wait_for_window(window)
+    assert reads == [extra] and page.result.reused == 4
+    # A second window must preserve the on-disk cache.
+    snapshot = page.model.library
+    window.close()
+    window = MainWindow()
+    window.loaded(snapshot)
+    window.compare_button.click()
+    page = window.comparison_page
+    page.start_button.click()
+    wait_for_window(window)
+    assert reads == [extra] and page.result.updated == 0
     window.close()
 
 

@@ -1,4 +1,7 @@
 from dataclasses import replace
+from contextlib import closing
+import os
+import sqlite3
 from threading import Event
 import wave
 
@@ -11,6 +14,7 @@ from rekordbox_manager.comparison import (
     compare_tracks, comparison_groups, read_middle, signature, similarity, verify_duplicate_groups,
 )
 from rekordbox_manager.domain import ManagerError, Track, find_duplicates
+from rekordbox_manager.comparison_store import ComparisonStore, remove_cached_tracks
 
 
 def write_wav(path, samples, rate=SAMPLE_RATE):
@@ -122,10 +126,11 @@ def test_track_groups_prefer_bitrate_then_playlists_and_show_minimum_score():
 
 
 @pytest.mark.parametrize("score, expected", [(89.9999, False), (90.0, False), (90.0001, True)])
-def test_duplicate_audio_requires_strictly_more_than_ninety_percent(tmp_path, monkeypatch, score, expected):
+@pytest.mark.parametrize("title", ["Song (Original)", "Song (Original Mix)"])
+def test_duplicate_audio_requires_strictly_more_than_ninety_percent(tmp_path, monkeypatch, score, expected, title):
     monkeypatch.setattr("rekordbox_manager.comparison.similarity", lambda *args: score)
     samples = np.random.default_rng(5).normal(0, 0.1, 12 * SAMPLE_RATE)
-    tracks = (Track("a", "Song (Original)", "Alice + Bob", path=str(write_mp3(tmp_path / "a.mp3", samples))),
+    tracks = (Track("a", title, "Alice + Bob", path=str(write_mp3(tmp_path / "a.mp3", samples))),
               Track("b", "Song", "Alice & Bob", path=str(write_mp3(tmp_path / "b.mp3", samples))))
     groups, notices = verify_duplicate_groups(find_duplicates(tracks))
     assert bool(groups) == expected
@@ -291,3 +296,172 @@ def test_reads_real_encoded_audio_across_formats_and_sample_rates(tmp_path, code
             output_file.mux(packet)
     assert similarity(signature(read_middle(source, Event())),
                       signature(read_middle(encoded, Event()))) >= 90
+
+
+@pytest.fixture
+def indexed_audio(tmp_path):
+    rng = np.random.default_rng(2026)
+    first, other = (rng.normal(0, 0.1, 12 * SAMPLE_RATE) for _ in range(2))
+    tracks = tuple(Track(key, key, "Artist", path=str(write_mp3(tmp_path / f"{key}.mp3", samples)))
+                   for key, samples in (("a", first), ("b", first), ("c", other)))
+    cache = tmp_path / "master.trackvergleich.sqlite3"
+    result = compare_tracks(tracks, Event(), cache_path=cache)
+    assert result.updated == 3 and result.checked == 3
+    assert [(m.first.id, m.second.id) for m in result.matches] == [("a", "b")]
+    return tracks, cache, first, other
+
+
+def test_persistent_scan_and_unchanged_update_never_decode_recompare_or_rewrite(indexed_audio, monkeypatch):
+    tracks, cache, _, _ = indexed_audio
+    before = cache.read_bytes()
+
+    def unexpected(*args):
+        pytest.fail("Unchanged tracks must use persisted results without decoding or comparing")
+
+    monkeypatch.setattr("rekordbox_manager.comparison.read_middle", unexpected)
+    monkeypatch.setattr("rekordbox_manager.comparison.similarity", unexpected)
+    for update in (False, True):
+        result = compare_tracks(tracks, Event(), cache_path=cache, update=update)
+        assert result.reused == 3 and result.updated == 0 and result.checked == 3
+        assert len(result.matches) == 1 and not result.skipped
+        assert cache.read_bytes() == before
+
+
+def test_update_indexes_only_new_files_and_compares_only_new_pairs(indexed_audio, tmp_path, monkeypatch):
+    from rekordbox_manager import comparison
+    tracks, cache, samples, _ = indexed_audio
+    extra = Track("d", "New title", "Artist", path=str(write_mp3(tmp_path / "d.mp3", samples)))
+    reads, scores = [], []
+    real_read, real_score = comparison.read_middle, comparison.similarity
+
+    def read(path, cancel):
+        reads.append(path)
+        return real_read(path, cancel)
+
+    def score(*args):
+        scores.append(True)
+        return real_score(*args)
+
+    monkeypatch.setattr(comparison, "read_middle", read)
+    monkeypatch.setattr(comparison, "similarity", score)
+    result = compare_tracks((*tracks, extra), Event(), cache_path=cache)
+    assert not reads and not scores and len(result.skipped) == 1
+    assert "Aktualisieren" in result.skipped[0]
+    result = compare_tracks((*tracks, extra), Event(), cache_path=cache, update=True)
+    assert reads == [tmp_path / "d.mp3"] and len(scores) == 3
+    assert result.updated == 1 and result.reused == 3
+    assert {(m.first.id, m.second.id) for m in result.matches} == {("a", "b"), ("a", "d"), ("b", "d")}
+
+
+def test_changed_file_is_excluded_until_update_and_old_matches_are_invalidated(indexed_audio, monkeypatch):
+    from rekordbox_manager import comparison
+    tracks, cache, _, other = indexed_audio
+    changed = tracks[0]
+    old_stat = os.stat(changed.path)
+    write_mp3(changed.path, other)
+    os.utime(changed.path, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns + 1_000_000_000))
+    reads = []
+    real_read = comparison.read_middle
+
+    def read(path, cancel):
+        reads.append(str(path))
+        return real_read(path, cancel)
+
+    monkeypatch.setattr(comparison, "read_middle", read)
+    result = compare_tracks(tracks, Event(), cache_path=cache)
+    assert not result.matches and not reads and len(result.skipped) == 1
+    result = compare_tracks(tracks, Event(), cache_path=cache, update=True)
+    assert reads == [changed.path] and result.updated == 1
+    assert [(m.first.id, m.second.id) for m in result.matches] == [("a", "c")]
+
+
+def test_artist_changes_reuse_audio_and_title_changes_use_current_metadata(indexed_audio, monkeypatch):
+    tracks, cache, _, _ = indexed_audio
+    changed = (replace(tracks[0], artist="Other"), *tracks[1:])
+    monkeypatch.setattr("rekordbox_manager.comparison.read_middle", lambda *args: pytest.fail("Reuse audio for metadata edits"))
+    result = compare_tracks(changed, Event(), cache_path=cache, update=True)
+    assert not result.matches and result.updated == 0
+    renamed = replace(tracks[0], title="Renamed")
+    result = compare_tracks((renamed, *tracks[1:]), Event(), cache_path=cache, update=True)
+    assert len(result.matches) == 1 and result.matches[0].first.title == "Renamed"
+
+
+def test_cached_deletion_cascades_and_external_removal_is_pruned(indexed_audio):
+    tracks, cache, _, _ = indexed_audio
+    remove_cached_tracks(cache.with_name("master.db"), ["a"])
+    with closing(sqlite3.connect(cache)) as connection:
+        assert connection.execute("SELECT id FROM tracks ORDER BY id").fetchall() == [("b",), ("c",)]
+        assert connection.execute("SELECT * FROM matches").fetchall() == []
+    result = compare_tracks(tracks[2:], Event(), cache_path=cache)
+    assert result.checked == 1 and not result.matches
+    with ComparisonStore(cache) as store:
+        assert set(store.entries()) == {"c"}
+
+
+@pytest.mark.parametrize("phase", ["index", "pairs"])
+def test_cancelled_persistent_scan_resumes_without_rereading_indexed_files(tmp_path, monkeypatch, phase):
+    from rekordbox_manager import comparison
+    samples = np.random.default_rng(123).normal(0, 0.1, 12 * SAMPLE_RATE)
+    tracks = tuple(Track(str(index), str(index), "Artist",
+                         path=str(write_mp3(tmp_path / f"{index}.mp3", samples))) for index in range(3))
+    cache = tmp_path / "cache.sqlite3"
+    cancel, reads = Event(), []
+    real_read = comparison.read_middle
+
+    def read(path, event):
+        reads.append(path)
+        return real_read(path, event)
+
+    def report(current, total, message):
+        if (phase == "index" and current == 1 and message.startswith("Vergleichsdatenbank")) or message.startswith("Trackpaare"):
+            cancel.set()
+
+    monkeypatch.setattr(comparison, "read_middle", read)
+    result = compare_tracks(tracks, cancel, report, cache_path=cache)
+    assert result.cancelled and not result.matches
+    result = compare_tracks(tracks, Event(), cache_path=cache)
+    assert len(result.matches) == 3 and not result.cancelled
+    # The interrupted decoder checks cancellation before opening a file.
+    assert sum(path == tmp_path / "0.mp3" for path in reads) == 1
+    if phase == "pairs":
+        assert len(reads) == 3
+
+
+def test_duplicate_file_references_use_persisted_audio_even_for_new_ids(indexed_audio, monkeypatch):
+    tracks, cache, _, _ = indexed_audio
+    extra = replace(tracks[0], id="d")
+    monkeypatch.setattr("rekordbox_manager.comparison.read_middle", lambda *args: pytest.fail("File already indexed"))
+    result = compare_tracks((extra, *tracks), Event(), cache_path=cache, update=True)
+    assert result.updated == 0 and result.reused == 4 and len(result.matches) == 3
+
+
+def test_cached_errors_are_reused_and_repaired_files_are_indexed(tmp_path, monkeypatch):
+    from rekordbox_manager import comparison
+    path = tmp_path / "broken.mp3"
+    path.write_bytes(b"corrupt")
+    track = Track("a", "A", "Artist", path=str(path))
+    cache = tmp_path / "cache.sqlite3"
+    result = compare_tracks((track,), Event(), cache_path=cache)
+    assert result.errors
+    real_read = comparison.read_middle
+    monkeypatch.setattr(comparison, "read_middle", lambda *args: pytest.fail("Unchanged broken file must not be decoded again"))
+    assert compare_tracks((track,), Event(), cache_path=cache, update=True).errors == result.errors
+    write_mp3(path, np.random.default_rng(8).normal(0, 0.1, 12 * SAMPLE_RATE))
+    monkeypatch.setattr(comparison, "read_middle", real_read)
+    result = compare_tracks((track,), Event(), cache_path=cache, update=True)
+    assert result.updated == 1 and not result.errors
+
+
+def test_algorithm_or_library_identity_change_rebuilds_the_cache(indexed_audio, monkeypatch):
+    tracks, cache, _, _ = indexed_audio
+    monkeypatch.setattr("rekordbox_manager.comparison_store.ALGORITHM_VERSION", "new-version")
+    assert compare_tracks(tracks, Event(), cache_path=cache).updated == 3
+    assert compare_tracks(tracks, Event(), cache_path=cache, library_id="other-library").updated == 3
+
+
+def test_unusable_persistent_database_reports_its_path(tmp_path):
+    path = tmp_path / "cache.sqlite3"
+    path.write_bytes(b"not a database")
+    with pytest.raises(ManagerError, match="Vergleichsdatenbank") as error:
+        compare_tracks((), Event(), cache_path=path)
+    assert str(path) in str(error.value)

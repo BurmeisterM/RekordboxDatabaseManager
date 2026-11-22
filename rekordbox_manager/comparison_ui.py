@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
 
 class ComparisonPage(QWidget):
     start_requested = Signal()
+    update_requested = Signal()
     cancel_requested = Signal()
 
     def __init__(self, model):
@@ -27,10 +28,14 @@ class ComparisonPage(QWidget):
         self.start_button = QPushButton("Trackvergleich starten")
         self.start_button.setObjectName("primary")
         self.start_button.clicked.connect(self.start_requested)
+        self.update_button = QPushButton("Aktualisieren")
+        self.update_button.setToolTip("Aktuelle Sammlung abgleichen und nur neue oder geänderte MP3-Dateien einlesen.")
+        self.update_button.clicked.connect(self.update_requested)
         self.cancel_button = QPushButton("Abbrechen")
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.request_cancel)
         toolbar.addWidget(self.start_button)
+        toolbar.addWidget(self.update_button)
         toolbar.addWidget(self.cancel_button)
         toolbar.addStretch()
         self.print_button = QPushButton("Fehlerhafte Dateien drucken…")
@@ -57,7 +62,9 @@ class ComparisonPage(QWidget):
         self.library_path = ""
         self.finished_at = ""
         self.model.set_library(None)
-        self.status.setText("Noch kein Trackvergleich durchgeführt. Verglichen werden nur MP3-Dateien desselben Interpreten in der geöffneten Sammlung.")
+        self.status.setText("MP3-Vergleich innerhalb desselben Interpreten. Beim ersten Start wird die Vergleichsdatenbank aufgebaut; "
+                            "danach werden gespeicherte Daten verwendet. „Aktualisieren“ erfasst neue und geänderte Tracks.")
+        self.status.setToolTip("")
         self.notices.clear()
         self.notices.hide()
         self.print_button.setEnabled(False)
@@ -68,7 +75,7 @@ class ComparisonPage(QWidget):
         self.cancel_button.setEnabled(True)
         self.progress.setRange(0, 0)
         self.progress.show()
-        self.status.setText("Die mittleren Audioausschnitte werden gelesen …")
+        self.status.setText("Die Vergleichsdatenbank wird vorbereitet …")
 
     def request_cancel(self):
         self.cancel_button.setEnabled(False)
@@ -93,6 +100,9 @@ class ComparisonPage(QWidget):
         self.status.setText("Trackvergleich abgebrochen. Keine unvollständigen Ergebnisse übernommen." if result.cancelled else
                             f"{len(library.groups)} Gruppen · {count} Tracks · {len(result.matches)} Trefferpaare mit mindestens 90 % · "
                             f"{result.checked} Titel geprüft · {len(result.skipped)} übersprungen · {len(result.errors)} Dateifehler")
+        if result.cache_path:
+            self.status.setText(self.status.text() + f" · {result.reused} aus Vergleichsdatenbank · {result.updated} Dateien neu eingelesen")
+            self.status.setToolTip(f"Vergleichsdatenbank: {result.cache_path}")
         self.notices.setPlainText("Übersprungene Dateien:\n\n" + "\n\n".join(result.skipped))
         self.notices.setVisible(bool(result.skipped))
         self.print_button.setEnabled(bool(result.errors))
@@ -104,6 +114,7 @@ class ComparisonPage(QWidget):
 
     def set_available(self, has_library, busy):
         self.start_button.setEnabled(has_library and not busy)
+        self.update_button.setEnabled(has_library and not busy)
         self.print_button.setEnabled(bool(self.result and self.result.errors) and not busy)
 
     def error_document(self):

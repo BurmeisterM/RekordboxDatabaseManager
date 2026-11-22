@@ -9,3 +9,4 @@ dist/
 .artifacts/
 RekordboxManager-Backups/
 RekordboxManager-Protokolle/
+*.trackvergleich.sqlite3*

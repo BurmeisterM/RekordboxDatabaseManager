@@ -28,14 +28,16 @@ def test_ignores_artist_separators_and_extra_spaces(artist):
     assert Track("1", "Song", artist).duplicate_key == Track("2", "song", "Alice Bob").duplicate_key
 
 
-@pytest.mark.parametrize("title", ["Song (Original)", "Song (ORIGINAL)  ", "(Original) Song"])
+@pytest.mark.parametrize("title", ["Song (Original)", "Song (ORIGINAL)  ", "(Original) Song",
+                                  "Song (Original Mix)", "Song (ORIGINAL MIX)  ",
+                                  "(Original Mix) Song", "Song (Original   Mix)"])
 def test_ignores_original_title_designation(title):
     assert Track("1", title, "Artist").duplicate_key == Track("2", "Song", "Artist").duplicate_key
-    assert Track("1", "Song (Original Mix)", "Artist").duplicate_key != Track("2", "Song", "Artist").duplicate_key
 
 
-def test_ignored_metadata_alone_does_not_form_a_group():
-    assert not find_duplicates([Track("1", "(Original)", "Artist"), Track("2", "(Original)", "Artist")])
+@pytest.mark.parametrize("title", ["(Original)", "(Original Mix)"])
+def test_ignored_metadata_alone_does_not_form_a_group(title):
+    assert not find_duplicates([Track("1", title, "Artist"), Track("2", title, "Artist")])
     assert not find_duplicates([Track("1", "Song", "+ &"), Track("2", "Song", " & + ")])
 
 
